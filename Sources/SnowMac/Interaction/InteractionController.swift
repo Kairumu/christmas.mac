@@ -50,6 +50,13 @@ final class InteractionController: SnowInteractionDelegate {
     private let dragGrowthFactor: CGFloat = 0.12
     private let scoopGrowthFactor: CGFloat = 0.35
 
+    /// Default ball-size proportions for a snowman assembled whole (not
+    /// from 3 separately player-grown balls) — 영서에게 눈사람 부탁. Decreasing
+    /// base->torso->head, matching an ordinary stacked snowman's look.
+    private static let builtSnowmanBaseRadius: CGFloat = 30
+    private static let builtSnowmanTorsoRadius: CGFloat = 22
+    private static let builtSnowmanHeadRadius: CGFloat = 15
+
     /// Key for the per-node action that polls a thrown object's physics body
     /// until it settles, so thrown objects can be re-tracked (see
     /// `throwDraggable`/`watchForSettle`).
@@ -178,6 +185,34 @@ final class InteractionController: SnowInteractionDelegate {
         }
     }
 
+    /// Right-click on deep-enough accumulated snow (SnowScene already
+    /// checked the depth rule): spawn a standalone ball at rest at p — same
+    /// ball-creation path as the scoop branch of mouseDown(atScenePoint:)
+    /// (minRadius + scoopGrowthFactor), but added straight into `snowballs`
+    /// with a pop-in instead of going through `.holding` (no drag in
+    /// progress to hold it for), so it's immediately draggable/stackable/
+    /// throwable like any other loose ball.
+    func spawnSnowball(atScenePoint p: CGPoint) {
+        guard let scene else { return }
+        let scooped = scene.scoopSnow(atScenePoint: p)
+        guard scooped > 0 else { return }
+
+        let ball = Snowball(radius: Snowball.minRadius)
+        ball.position = p
+        ball.grow(by: scooped * scoopGrowthFactor)
+        ball.setScale(0.01)
+        ball.alpha = 0
+        scene.addChild(ball)
+        ball.run(.group([.fadeIn(withDuration: 0.12), .scale(to: 1.0, duration: 0.12)]))
+        snowballs.append(ball)
+    }
+
+    /// 영서가 눈사람을 만들어주는 메뉴: assemble a complete snowman directly at p,
+    /// via the same shared helper the 3rd-ball stack completion uses.
+    func buildSnowman(atScenePoint p: CGPoint) {
+        spawnSnowman(at: p, baseRadius: Self.builtSnowmanBaseRadius, torsoRadius: Self.builtSnowmanTorsoRadius, headRadius: Self.builtSnowmanHeadRadius)
+    }
+
     func isInteractive(atScenePoint p: CGPoint) -> Bool {
         ballNear(p) != nil || snowmanNear(p) != nil || partialStackNear(p) != nil
     }
@@ -255,16 +290,26 @@ final class InteractionController: SnowInteractionDelegate {
             partialStacks.remove(at: idx)
 
             let sorted = entry.balls.sorted { $0.radius > $1.radius }
-            let snowman = Snowman(
-                basePoint: entry.point,
-                variant: SnowmanVariant.next(),
-                baseRadius: sorted[0].radius,
-                torsoRadius: sorted[1].radius,
-                headRadius: sorted[2].radius
-            )
-            scene?.addChild(snowman)
-            snowmen.append(snowman)
+            spawnSnowman(at: entry.point, baseRadius: sorted[0].radius, torsoRadius: sorted[1].radius, headRadius: sorted[2].radius)
         }
+    }
+
+    /// Shared snowman-assembly entry point: constructs a Snowman (which
+    /// itself runs the staged parts-appear-one-by-one pop-in) and registers
+    /// it in `snowmen` so it's clickable/throwable/resettable like any
+    /// other. Used both by the 3rd-ball stack completion above and by
+    /// buildSnowman(atScenePoint:) (영서에게 눈사람 부탁), so the two paths never
+    /// duplicate the assembly/registration logic.
+    private func spawnSnowman(at point: CGPoint, baseRadius: CGFloat, torsoRadius: CGFloat, headRadius: CGFloat) {
+        let snowman = Snowman(
+            basePoint: point,
+            variant: SnowmanVariant.next(),
+            baseRadius: baseRadius,
+            torsoRadius: torsoRadius,
+            headRadius: headRadius
+        )
+        scene?.addChild(snowman)
+        snowmen.append(snowman)
     }
 
     private func makePartialStackVisual(balls: [Snowball], at point: CGPoint) -> SKNode {

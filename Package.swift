@@ -9,7 +9,8 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "SnowMac",
-            path: "Sources/SnowMac"
+            path: "Sources/SnowMac",
+            resources: [.copy("Resources")]
         )
     ]
 )

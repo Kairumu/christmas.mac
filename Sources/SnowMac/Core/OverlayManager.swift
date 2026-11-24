@@ -11,17 +11,28 @@ final class OverlayManager {
     private var settingsObserver: NSObjectProtocol?
     private var lowPowerObserver: NSObjectProtocol?
 
-    // MARK: - Run-state aggregation (QW4/P9)
+    // MARK: - Run-state aggregation (P9)
     //
-    // isPaused has exactly one owner: updateRunState(). Any future pause
-    // cause must be folded in here rather than setting scene.isPaused
-    // directly elsewhere, or causes will clobber each other. manualOff
-    // (intensity == .off) is intentionally NOT a cause here — it already
-    // stops spawning on its own (graceful stop, not a freeze). Low power is
-    // also not a pause cause — it only throttles spawn rate/wind, handled
-    // via `lowPowerMode` below.
-    private var fullscreenStates: [ObjectIdentifier: Bool] = [:]
+    // scene.isPaused used to also be driven by per-screen fullscreen state
+    // (feature QW4: fullscreen -> freeze snowfall). SKScene.isPaused
+    // freezes every in-flight flake exactly where it happened to be —
+    // that read as snow stuck scattered mid-air/mid-screen, not as a pile
+    // forming anywhere. The actual desired behavior (explicit user
+    // expectation) is the opposite: snow keeps falling during fullscreen
+    // and piles on screenBottom like normal. The fullscreen-pause path has
+    // been removed entirely — isPaused now has no cause at all and is left
+    // at SKScene's default (false). manualOff (intensity == .off) was
+    // never a pause cause either — it already stops spawning on its own
+    // (graceful stop, not a freeze). Low power is also not a pause cause —
+    // it only throttles spawn rate/wind, handled via `lowPowerMode` below.
     private var lowPowerActive = ProcessInfo.processInfo.isLowPowerModeEnabled
+
+    /// The set of enabled display IDs as of the last rebuildWindows() call.
+    /// Settings changes fire frequently (intensity, snowOnWindows, etc.) but
+    /// only a change to THIS set requires tearing down/creating windows —
+    /// rebuildWindows() destroys accumulated snow on screens it recreates,
+    /// so we must not call it on every settings change.
+    private var lastEnabledDisplayIDs: Set<CGDirectDisplayID> = []
 
     init(settings: SettingsStore) {
         self.settings = settings
@@ -49,6 +60,7 @@ final class OverlayManager {
             queue: .main
         ) { [weak self] _ in
             self?.applySettingsToScenes()
+            self?.rebuildWindowsIfEnabledDisplaysChanged()
         }
 
         NotificationCenter.default.addObserver(
@@ -107,7 +119,10 @@ final class OverlayManager {
         var matchedDisplayIDs = Set<CGDirectDisplayID>()
 
         for window in windows {
-            guard let id = window.displayID, let screen = screensByDisplayID[id], matchedDisplayIDs.insert(id).inserted else {
+            guard let id = window.displayID,
+                  let screen = screensByDisplayID[id],
+                  settings.isDisplayEnabled(id),
+                  matchedDisplayIDs.insert(id).inserted else {
                 teardownWindow(window)
                 continue
             }
@@ -118,7 +133,7 @@ final class OverlayManager {
         }
 
         for screen in screens {
-            guard let id = displayID(for: screen), !matchedDisplayIDs.contains(id) else { continue }
+            guard let id = displayID(for: screen), !matchedDisplayIDs.contains(id), settings.isDisplayEnabled(id) else { continue }
             matchedDisplayIDs.insert(id)
             let (scene, controller) = makeScene(size: screen.frame.size)
             let window = OverlayWindow(screen: screen, scene: scene)
@@ -127,6 +142,29 @@ final class OverlayManager {
         }
 
         windows = survivors
+        lastEnabledDisplayIDs = enabledDisplayIDs(in: screensByDisplayID.keys)
+    }
+
+    /// Shared by rebuildWindows() (to cache what was just applied) and
+    /// rebuildWindowsIfEnabledDisplaysChanged() (to detect what changed).
+    private func enabledDisplayIDs<S: Sequence>(in displayIDs: S) -> Set<CGDirectDisplayID> where S.Element == CGDirectDisplayID {
+        Set(displayIDs.filter { settings.isDisplayEnabled($0) })
+    }
+
+    /// Per-display enable/disable is the only settings change that requires
+    /// a structural rebuild (create/teardown windows) — every other
+    /// settings change (intensity, snowOnWindows, etc.) is handled by
+    /// applySettingsToScenes() alone. Compares against lastEnabledDisplayIDs
+    /// so a rebuild only happens when the enabled set actually changed.
+    private func rebuildWindowsIfEnabledDisplaysChanged() {
+        var connectedDisplayIDs: [CGDirectDisplayID] = []
+        for screen in NSScreen.screens {
+            if let id = displayID(for: screen) {
+                connectedDisplayIDs.append(id)
+            }
+        }
+        guard enabledDisplayIDs(in: connectedDisplayIDs) != lastEnabledDisplayIDs else { return }
+        rebuildWindows()
     }
 
     /// Real teardown for a window whose screen is gone — `orderOut` alone
@@ -173,6 +211,15 @@ final class OverlayManager {
         windows.forEach { $0.scene.summonSnowplow() }
     }
 
+    func summonSweeper() {
+        windows.forEach { $0.scene.summonSweeper() }
+    }
+
+    /// 영서에게 눈사람 부탁.
+    func requestSnowmanBuild() {
+        windows.forEach { $0.scene.summonSweeperForSnowman() }
+    }
+
     func resetAllSnow() {
         windows.forEach { $0.scene.resetAllSnow() }
     }
@@ -185,22 +232,6 @@ final class OverlayManager {
     /// "눈사람 리셋": interaction objects (snowballs/snowmen) only.
     func resetSnowmen() {
         windows.forEach { $0.scene.interactionDelegate?.resetAll() }
-    }
-
-    /// Fed by WindowTracker's 10Hz poll (feature QW4). Updates this screen's
-    /// fullscreen-pause cause and re-derives isPaused for every window.
-    func updateFullscreenStates(_ states: [ObjectIdentifier: Bool]) {
-        fullscreenStates = states
-        updateRunState()
-    }
-
-    /// Single owner of `scene.isPaused`. See the comment above
-    /// `fullscreenStates` for why pause causes must be combined here.
-    private func updateRunState() {
-        for window in windows {
-            guard let screen = window.screen else { continue }
-            window.scene.isPaused = fullscreenStates[ObjectIdentifier(screen)] ?? false
-        }
     }
 
     private func applyLowPowerState() {

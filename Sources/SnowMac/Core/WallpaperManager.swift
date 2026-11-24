@@ -38,6 +38,29 @@ final class WallpaperManager {
         "snowmac.originalWallpaper.\(displayID)"
     }
 
+    /// Marks a screen as "we tried to capture its original wallpaper and
+    /// couldn't trust the result" — distinct from the key being absent
+    /// (meaning "capture simply hasn't happened yet"). Lets restore tell
+    /// the user why nothing happened instead of silently no-oping or,
+    /// worse, applying whatever NSWorkspace handed back anyway.
+    private static let uncapturableSentinel = "snowmac.uncapturable"
+
+    /// A captured URL is only trustworthy if it's a real file that exists
+    /// right now AND isn't one of our OWN generated wallpapers. The second
+    /// check matters because `apply()` always calls this capture function
+    /// first — if a SnowMac wallpaper was already on screen when capture
+    /// ran (e.g. an earlier session that quit without ever restoring),
+    /// NSWorkspace.desktopImageURL(for:) would legitimately return OUR PNG
+    /// path, and persisting that as "the original" would make restore just
+    /// reapply one of our own winter wallpapers instead of the user's real
+    /// one.
+    private func isTrustworthyOriginal(_ url: URL) -> Bool {
+        guard url.isFileURL else { return false }
+        guard FileManager.default.fileExists(atPath: url.path) else { return false }
+        let ownDir = cacheDirectory.standardizedFileURL.path
+        return !url.standardizedFileURL.path.hasPrefix(ownDir)
+    }
+
     /// Captures each screen's current desktop image URL before this app's
     /// FIRST wallpaper apply this run, persisted so it survives restarts.
     /// Only captures when no saved original exists yet for that screen —
@@ -49,22 +72,56 @@ final class WallpaperManager {
             guard let displayID = displayID(for: screen) else { continue }
             let key = originalWallpaperKey(for: displayID)
             guard defaults.string(forKey: key) == nil else { continue }
-            guard let url = NSWorkspace.shared.desktopImageURL(for: screen) else { continue }
-            defaults.set(url.absoluteString, forKey: key)
+            // NSWorkspace.desktopImageURL(for:) can return nil outright (a
+            // dynamic/rotating wallpaper has no single static file to
+            // report), or — the failure mode actually found persisted on
+            // this machine's real defaults, both screens — a URL that
+            // isn't the user's real original at all. Validate before
+            // trusting it; if it fails, store a sentinel rather than
+            // either a bogus URL or nothing, so restore can tell "this
+            // screen can't be restored" from "not captured yet" and say so
+            // instead of quietly doing nothing.
+            if let url = NSWorkspace.shared.desktopImageURL(for: screen), isTrustworthyOriginal(url) {
+                defaults.set(url.absoluteString, forKey: key)
+            } else {
+                defaults.set(WallpaperManager.uncapturableSentinel, forKey: key)
+            }
         }
     }
 
     /// Restores each screen's original wallpaper, if one was captured.
-    /// Screens with no saved original, or whose saved file no longer
-    /// exists, are skipped gracefully (no error, no crash).
+    /// Screens with no saved original are skipped gracefully. A screen
+    /// whose saved value is detectably wrong — the uncapturable sentinel,
+    /// a URL pointing at a now-missing file, or (from an older build) one
+    /// of our own generated wallpapers — has its stored key CLEARED rather
+    /// than left in place, so the next apply() re-captures whatever is
+    /// actually on screen then instead of staying stuck on dead/self data
+    /// forever. Shows one alert if any screen couldn't be restored.
     func restoreOriginalWallpapers() {
         let defaults = UserDefaults.standard
+        var anyUncapturable = false
         for screen in NSScreen.screens {
             guard let displayID = displayID(for: screen) else { continue }
             let key = originalWallpaperKey(for: displayID)
-            guard let urlString = defaults.string(forKey: key), let url = URL(string: urlString) else { continue }
-            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            guard let stored = defaults.string(forKey: key) else { continue }
+
+            if stored == WallpaperManager.uncapturableSentinel {
+                anyUncapturable = true
+                continue
+            }
+            guard let url = URL(string: stored), isTrustworthyOriginal(url) else {
+                defaults.removeObject(forKey: key)
+                continue
+            }
             try? NSWorkspace.shared.setDesktopImageURL(url, for: screen, options: [:])
+        }
+
+        if anyUncapturable {
+            let alert = NSAlert()
+            alert.messageText = "원래 배경화면을 복원할 수 없어요"
+            alert.informativeText = "현재 배경화면 방식(동적 배경 등)은 자동 저장을 지원하지 않아요."
+            alert.alertStyle = .informational
+            alert.runModal()
         }
     }
 

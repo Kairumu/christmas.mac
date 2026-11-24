@@ -20,9 +20,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowTracker.onSurfaceRemoved = { [weak overlayManager] surface in
             overlayManager?.surfaceRemoved(surface)
         }
-        windowTracker.onFullscreenStatesUpdated = { [weak overlayManager] states in
-            overlayManager?.updateFullscreenStates(states)
-        }
         self.windowTracker = windowTracker
         windowTracker.start()
 

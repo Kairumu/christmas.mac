@@ -11,6 +11,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     private var intensityMenuItems: [SnowIntensity: NSMenuItem] = [:]
     private var countdownItem: NSMenuItem!
     private var launchAtLoginItem: NSMenuItem!
+    private var displayMenu: NSMenu!
 
     init(settings: SettingsStore, overlayManager: OverlayManager) {
         self.settings = settings
@@ -29,8 +30,32 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     func menuWillOpen(_ menu: NSMenu) {
+        if menu === displayMenu {
+            rebuildDisplayMenu()
+            return
+        }
         updateCountdown()
         launchAtLoginItem.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
+    }
+
+    /// Rebuilt on every open (not cached) so hotplugged displays appear
+    /// immediately, same rationale as updateCountdown() above.
+    private func rebuildDisplayMenu() {
+        displayMenu.removeAllItems()
+        for (index, screen) in NSScreen.screens.enumerated() {
+            guard let id = displayID(for: screen) else { continue }
+            let name = screen.localizedName
+            let item = NSMenuItem(title: name.isEmpty ? "디스플레이 \(index + 1)" : name, action: #selector(toggleDisplayEnabled(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = NSNumber(value: id)
+            item.state = settings.isDisplayEnabled(id) ? .on : .off
+            displayMenu.addItem(item)
+        }
+    }
+
+    private func displayID(for screen: NSScreen) -> CGDirectDisplayID? {
+        guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
+        return CGDirectDisplayID(number.uint32Value)
     }
 
     private func updateCountdown() {
@@ -79,7 +104,22 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         plowItem.target = self
         menu.addItem(plowItem)
 
+        let sweeperItem = NSMenuItem(title: "영서 소환", action: #selector(summonSweeper), keyEquivalent: "")
+        sweeperItem.target = self
+        menu.addItem(sweeperItem)
+
+        let snowmanBuildItem = NSMenuItem(title: "영서에게 눈사람 부탁", action: #selector(requestSnowmanBuild), keyEquivalent: "")
+        snowmanBuildItem.target = self
+        menu.addItem(snowmanBuildItem)
+
         menu.addItem(.separator())
+
+        let displayMenu = NSMenu()
+        displayMenu.delegate = self
+        self.displayMenu = displayMenu
+        let displayItem = NSMenuItem(title: "눈 내릴 화면", action: nil, keyEquivalent: "")
+        menu.setSubmenu(displayMenu, for: displayItem)
+        menu.addItem(displayItem)
 
         let wallpaperMenu = NSMenu()
         for i in 1...wallpaperManager.wallpaperCount {
@@ -146,12 +186,28 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         overlayManager.summonSnowplow()
     }
 
+    @objc private func summonSweeper() {
+        overlayManager.summonSweeper()
+    }
+
+    @objc private func requestSnowmanBuild() {
+        overlayManager.requestSnowmanBuild()
+    }
+
     @objc private func selectWallpaper(_ sender: NSMenuItem) {
         wallpaperManager.apply(wallpaperIndex: sender.tag)
     }
 
     @objc private func restoreOriginalWallpaper() {
         wallpaperManager.restoreOriginalWallpapers()
+    }
+
+    @objc private func toggleDisplayEnabled(_ sender: NSMenuItem) {
+        guard let number = sender.representedObject as? NSNumber else { return }
+        let id = CGDirectDisplayID(number.uint32Value)
+        let enabled = !settings.isDisplayEnabled(id)
+        settings.setDisplay(id, enabled: enabled)
+        sender.state = enabled ? .on : .off
     }
 
     @objc private func toggleSnowOnWindows(_ sender: NSMenuItem) {
