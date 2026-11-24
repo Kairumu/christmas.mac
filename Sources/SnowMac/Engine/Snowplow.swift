@@ -15,6 +15,11 @@ enum Snowplow {
         onFinish: @escaping () -> Void
     ) {
         let truck = makeTruckNode()
+        // Overall visual size knob. SKShapeNode scales as vectors, so this
+        // is lossless; wheelClearance below must scale with it (the wheel
+        // art's local y=-8 offset becomes -8 * truckScale on screen).
+        let truckScale: CGFloat = 1.6
+        truck.setScale(truckScale)
         let startX = state.surface.minX - 60
         let endX = state.surface.maxX + 60
         // Ride along the TOP of the accumulated snow (surface baseline +
@@ -27,7 +32,7 @@ enum Snowplow {
         // art's own wheel offset (wheels are drawn at y=-8 relative to the
         // truck root in makeTruckNode(), see below) so the wheels visually
         // land right on the local snow top instead of floating above it.
-        let wheelClearance: CGFloat = 8
+        let wheelClearance: CGFloat = 8 * truckScale
         truck.position = CGPoint(x: startX, y: accumulator.topY(of: state, atX: startX) + wheelClearance)
         truck.zPosition = 30
         parent.addChild(truck)

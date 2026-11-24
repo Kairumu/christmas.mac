@@ -215,6 +215,11 @@ final class OverlayManager {
         windows.forEach { $0.scene.summonSweeper() }
     }
 
+    /// 블리자드: one-shot storm burst on every screen's scene.
+    func triggerBlizzard() {
+        windows.forEach { $0.scene.triggerBlizzard() }
+    }
+
     /// 영서에게 눈사람 부탁.
     func requestSnowmanBuild() {
         windows.forEach { $0.scene.summonSweeperForSnowman() }

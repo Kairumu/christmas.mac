@@ -6,13 +6,25 @@ import CoreGraphics
 /// `tick()`/`fastUntil` below) — converts window bounds into scene-space
 /// [Surface] (top edges of normal windows, the Dock, and each screen's bottom edge),
 /// and diffs against the previous poll to detect removed surfaces (feature 04).
+///
+/// All of that — the CGWindowListCopyWindowInfo query, the O(n²) occlusion
+/// pass, and the windowStillExists re-queries — runs on a dedicated serial
+/// background queue, NOT the main thread. At 10-30 Hz those were multi-ms
+/// main-thread blocks that showed up as periodic hitches in SpriteKit's
+/// 60fps render loop. The one main-thread-only API involved, NSScreen, is
+/// never touched from that background queue: `screensSnapshot` is a
+/// lock-protected snapshot of each screen's frame/displayID, refreshed on
+/// the main thread (at `start()` and on every screen-parameters-changed
+/// notification), and the poll reads that snapshot instead of
+/// `NSScreen.screens` directly. Both callbacks
+/// (`onSurfacesUpdated`/`onSurfaceRemoved`) are always delivered on the main
+/// thread via `DispatchQueue.main.async`, since they ultimately mutate
+/// SKScene/SKNode state.
 final class WindowTracker {
     var onSurfacesUpdated: (([Surface]) -> Void)?
     var onSurfaceRemoved: ((Surface) -> Void)?
 
     private let settings: SettingsStore
-    private var timer: Timer?
-    private var previousSurfaces: [Surface] = []
     private let ownPID = ProcessInfo.processInfo.processIdentifier
 
     private let minWindowWidth: CGFloat = 40
@@ -28,11 +40,24 @@ final class WindowTracker {
         self.settings = settings
     }
 
-    /// The timer itself runs at 30 Hz so a window drag is sampled finely
-    /// enough for Accumulation's move-smoothing (Engine/Accumulation.swift)
-    /// to animate between poll points smoothly. Running the FULL poll (the
+    // MARK: - Background polling queue & timer
+
+    /// Dedicated serial queue the CGWindowList query, occlusion math, and
+    /// windowStillExists re-queries all run on. `.utility` QoS: this work
+    /// must never contend with (or deprioritize) the main thread's 60fps
+    /// render loop, which is the whole point of moving it off-main.
+    /// Serial + never re-entered, so `previousSurfaces`/`tickCounter`/
+    /// `fastUntil` below need no extra synchronization beyond "only ever
+    /// touched on this queue."
+    private let queue = DispatchQueue(label: "com.kairu.snowmac.windowtracker.poll", qos: .utility)
+    private var timerSource: DispatchSourceTimer?
+    private var previousSurfaces: [Surface] = []
+
+    /// The timer fires at 30 Hz so a window drag is sampled finely enough
+    /// for Accumulation's move-smoothing (Engine/Accumulation.swift) to
+    /// animate between poll points smoothly. Running the FULL poll (the
     /// CGWindowListCopyWindowInfo query plus occlusion math) at 30 Hz at all
-    /// times would triple idle CPU cost for no visible benefit, though — so
+    /// times would triple idle cost for no visible benefit, though — so
     /// `tick()` below gates most ticks out, and only the full poll's own
     /// cost (not the near-free gate check) ever runs at the higher rate.
     private let pollInterval: TimeInterval = 1.0 / 30.0
@@ -49,31 +74,104 @@ final class WindowTracker {
     /// idle cost unchanged from before this change.
     private var tickCounter = 0
 
+    /// Bumped by `stop()`; a poll's main-thread delivery block compares its
+    /// captured generation against this CURRENT value before invoking any
+    /// callback, so a poll already in flight on `queue` when `stop()` is
+    /// called can never deliver a callback afterward. Only ever read/written
+    /// on the main thread (set in `start()`, incremented in `stop()`,
+    /// compared inside the `DispatchQueue.main.async` block in `poll(_:_:)`)
+    /// — never touched from `queue` itself, so it needs no lock of its own.
+    private var generation = 0
+
+    private var screenParamsObserver: NSObjectProtocol?
+
     func start() {
-        timer?.invalidate()
-        tickCounter = 0
-        timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
-            self?.tick()
+        stop()
+        refreshScreensSnapshot()
+        screenParamsObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.refreshScreensSnapshot()
         }
-        RunLoop.main.add(timer!, forMode: .common)
+
+        tickCounter = 0
+        let currentGeneration = generation
+        let source = DispatchSource.makeTimerSource(queue: queue)
+        source.schedule(deadline: .now(), repeating: pollInterval, leeway: .milliseconds(1))
+        source.setEventHandler { [weak self] in
+            self?.tick(generation: currentGeneration)
+        }
+        timerSource = source
+        source.resume()
     }
 
     func stop() {
-        timer?.invalidate()
-        timer = nil
+        timerSource?.cancel()
+        timerSource = nil
+        if let screenParamsObserver {
+            NotificationCenter.default.removeObserver(screenParamsObserver)
+        }
+        screenParamsObserver = nil
+        // Invalidates any poll already in flight on `queue` — see
+        // `generation`'s doc comment above.
+        generation += 1
     }
 
-    /// Runs on every 30 Hz timer fire; decides whether THIS tick actually
-    /// does the (comparatively expensive) full poll, or returns immediately
-    /// at near-zero cost. See `fastUntil`/`tickCounter` above for the rule.
-    private func tick() {
+    /// Runs on `queue` on every 30 Hz timer fire; decides whether THIS tick
+    /// actually does the (comparatively expensive) full poll, or returns
+    /// immediately at near-zero cost. See `fastUntil`/`tickCounter` above
+    /// for the rule.
+    private func tick(generation: Int) {
         tickCounter += 1
         let now = ProcessInfo.processInfo.systemUptime
         guard now < fastUntil || tickCounter % 3 == 0 else { return }
-        poll(now: now)
+        poll(now: now, generation: generation)
     }
 
-    private func poll(now: TimeInterval) {
+    // MARK: - Screen snapshot (main-thread-only NSScreen access)
+
+    /// One screen's frame + displayID, captured on the main thread.
+    /// `screenContaining`/`topLeftOffsetY`/`screenBottomSurface` below read
+    /// this instead of touching `NSScreen` directly — NSScreen is
+    /// main-thread-only API, and the poll that needs this data runs on the
+    /// background `queue`.
+    private struct ScreenSnapshot {
+        let frame: CGRect
+        let displayID: CGDirectDisplayID
+    }
+
+    private let screensLock = NSLock()
+    private var _screensSnapshot: [ScreenSnapshot] = []
+    /// Lock-protected: written on the main thread by
+    /// `refreshScreensSnapshot()`, read from the background poll queue.
+    private var screensSnapshot: [ScreenSnapshot] {
+        get { screensLock.lock(); defer { screensLock.unlock() }; return _screensSnapshot }
+        set { screensLock.lock(); _screensSnapshot = newValue; screensLock.unlock() }
+    }
+
+    /// Must be called on the main thread. Refreshed at `start()` and on
+    /// every `didChangeScreenParametersNotification` — display hotplug,
+    /// resolution/arrangement changes, display sleep/wake, Dock auto-hide
+    /// `visibleFrame` changes.
+    private func refreshScreensSnapshot() {
+        screensSnapshot = NSScreen.screens.compactMap { screen in
+            guard let id = WindowTracker.displayID(for: screen) else { return nil }
+            return ScreenSnapshot(frame: screen.frame, displayID: id)
+        }
+    }
+
+    /// The physical display id backing an NSScreen. Main-thread only (reads
+    /// NSScreen); used solely to build `screensSnapshot` above.
+    private static func displayID(for screen: NSScreen) -> CGDirectDisplayID? {
+        guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
+        return CGDirectDisplayID(number.uint32Value)
+    }
+
+    // MARK: - Poll (runs entirely on `queue`, main-thread APIs excluded)
+
+    private func poll(now: TimeInterval, generation: Int) {
         let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
         guard let infoList = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
             return
@@ -81,7 +179,7 @@ final class WindowTracker {
 
         var surfaces: [Surface] = []
 
-        for screen in NSScreen.screens {
+        for screen in screensSnapshot {
             if let bottom = screenBottomSurface(for: screen) {
                 surfaces.append(bottom)
             }
@@ -139,49 +237,63 @@ final class WindowTracker {
             }
         }
 
-        // Must fire BEFORE onSurfacesUpdated, not after. onSurfaceRemoved's
-        // spill (feature 04) looks up the closed window's SurfaceState in
-        // the scene's accumulator to read its piled-up snow. But
-        // onSurfacesUpdated's reconciliation (SnowAccumulator.updateSurfaces)
-        // already drops the SurfaceState for any surface missing from the
-        // new `surfaces` list — which a just-closed window always is. Firing
-        // onSurfacesUpdated first meant that by the time onSurfaceRemoved
-        // ran, the state was already gone: its lookup silently missed every
-        // single time, so the spill never fired regardless of the
-        // windowStillExists check below. This is what actually caused
-        // "closing a window no longer spills its snow" — not a Space-switch
-        // misclassification; windowStillExists itself was verified correct
-        // (confirmed false within ~300ms of a real close, across Calculator
-        // quit and multiple Finder window closes, with SNOWMAC_DEBUG).
-        for surface in removed {
-            // A window that disappeared from .optionOnScreenOnly but still
-            // exists (queryable by id) is on another Space, or minimized —
-            // not closed. Only fire the explicit spill for windows that are
-            // truly gone. This is an exact per-window check rather than a
-            // count/ratio heuristic, so it is correct for both a single
-            // window close (must spill) and a mass app-quit (must spill
-            // every one).
-            //
-            // This check is a heuristic, not a guarantee, in two ways: (1)
-            // a window mid close-fade animation can still be queryable here
-            // for a poll or two after its shrinking/fading bounds already
-            // failed windowSurfaces()'s size/alpha filters, so it reads as
-            // "still exists" even though it's actually closing; (2) an
-            // occlusion-driven segment reindex on a still-open window can
-            // make an old segment's Kind vanish from `surfaces` with no
-            // per-window check to run at all. Both cases — and a genuine
-            // Space switch/minimize — fall through without firing
-            // onSurfaceRemoved here. SnowAccumulator.updateSurfaces's
-            // reconciliation still drops that surface's SurfaceState this
-            // same poll regardless (it's simply missing from the incoming
-            // list), so SnowScene.updateSurfaces spills whatever
-            // reconciliation drops as a safety net — see the comment there.
-            // That means a genuine Space switch is no longer silent either:
-            // its snow spills too, rather than being discarded unspilled.
-            if case .window(let id, _) = surface.kind, windowStillExists(id) { continue }
-            onSurfaceRemoved?(surface)
+        // windowStillExists is itself another CGWindowList query — kept
+        // here on `queue` with the rest of the poll, NOT dispatched to main,
+        // so only the final callback invocations below ever touch main.
+        //
+        // Must be resolved BEFORE onSurfacesUpdated fires, not after.
+        // onSurfaceRemoved's spill (feature 04) looks up the closed window's
+        // SurfaceState in the scene's accumulator to read its piled-up snow.
+        // But onSurfacesUpdated's reconciliation (SnowAccumulator.
+        // updateSurfaces) already drops the SurfaceState for any surface
+        // missing from the new `surfaces` list — which a just-closed window
+        // always is. Delivering onSurfacesUpdated first meant that by the
+        // time onSurfaceRemoved ran, the state was already gone: its lookup
+        // silently missed every single time, so the spill never fired
+        // regardless of the windowStillExists check below. This is what
+        // actually caused "closing a window no longer spills its snow" —
+        // not a Space-switch misclassification; windowStillExists itself was
+        // verified correct (confirmed false within ~300ms of a real close,
+        // across Calculator quit and multiple Finder window closes, with
+        // SNOWMAC_DEBUG). The main-thread delivery block below preserves
+        // this ordering (onSurfaceRemoved for each trulyRemoved surface,
+        // THEN onSurfacesUpdated).
+        //
+        // A window that disappeared from .optionOnScreenOnly but still
+        // exists (queryable by id) is on another Space, or minimized — not
+        // closed. Only fire the explicit spill for windows that are truly
+        // gone. This is an exact per-window check rather than a count/ratio
+        // heuristic, so it is correct for both a single window close (must
+        // spill) and a mass app-quit (must spill every one).
+        //
+        // This check is a heuristic, not a guarantee, in two ways: (1) a
+        // window mid close-fade animation can still be queryable here for a
+        // poll or two after its shrinking/fading bounds already failed
+        // windowSurfaces()'s size/alpha filters, so it reads as "still
+        // exists" even though it's actually closing; (2) an occlusion-driven
+        // segment reindex on a still-open window can make an old segment's
+        // Kind vanish from `surfaces` with no per-window check to run at
+        // all. Both cases — and a genuine Space switch/minimize — fall
+        // through without firing onSurfaceRemoved here.
+        // SnowAccumulator.updateSurfaces's reconciliation still drops that
+        // surface's SurfaceState this same poll regardless (it's simply
+        // missing from the incoming list), so SnowScene.updateSurfaces
+        // spills whatever reconciliation drops as a safety net — see the
+        // comment there. That means a genuine Space switch is no longer
+        // silent either: its snow spills too, rather than being discarded
+        // unspilled.
+        let trulyRemoved = removed.filter { surface in
+            if case .window(let id, _) = surface.kind, windowStillExists(id) { return false }
+            return true
         }
-        onSurfacesUpdated?(surfaces)
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.generation == generation else { return }
+            for surface in trulyRemoved {
+                self.onSurfaceRemoved?(surface)
+            }
+            self.onSurfacesUpdated?(surfaces)
+        }
     }
 
     /// True fullscreen (a Space-filling app, e.g. full-screen video) covers
@@ -203,18 +315,30 @@ final class WindowTracker {
     /// screen top, which isn't a real snow-catching ledge, and letting a
     /// surface through there would catch flakes an instant after they
     /// spawn instead of letting them fall all the way to screenBottom.
-    private func isFullscreenWindow(x: CGFloat, y: CGFloat, width: CGFloat, height: CGFloat, screen: NSScreen) -> Bool {
+    private func isFullscreenWindow(x: CGFloat, y: CGFloat, width: CGFloat, height: CGFloat, screen: ScreenSnapshot) -> Bool {
         let epsilon: CGFloat = 2
         let screenRelativeY = y - topLeftOffsetY(for: screen)
         let startsAtTop = abs(screenRelativeY) <= epsilon
         let coversFullHeight = abs(height - screen.frame.height) <= epsilon
         let coversFullWidth = width >= screen.frame.width - epsilon
-        return startsAtTop && coversFullHeight && coversFullWidth
+        if startsAtTop && coversFullHeight && coversFullWidth { return true }
+        // MAXIMIZED counts too (user: "창이 전체 화면일 때는 바닥에만 쌓이도록"):
+        // a window filling nearly the whole screen — even sitting below the
+        // menu bar rather than covering it — shouldn't collect a snow ledge
+        // along the screen's top edge; let the snow fall through to the
+        // bottom instead. Threshold is deliberately generous (≥92% width,
+        // ≥85% height) so ordinary large windows keep their snow while
+        // zoomed/maximized ones don't.
+        let nearFullWidth = width >= screen.frame.width * 0.92
+        let nearFullHeight = height >= screen.frame.height * 0.85
+        return nearFullWidth && nearFullHeight
     }
 
     /// A window that still exists (anywhere — any Space, minimized, etc.)
     /// but is no longer `.optionOnScreenOnly` is a Space switch / minimize,
-    /// not a close. Exact existence check, no count/ratio guessing.
+    /// not a close. Exact existence check, no count/ratio guessing. Runs on
+    /// `queue`, same as the rest of the poll — this is a CGWindowList query,
+    /// not a main-thread-only API.
     private func windowStillExists(_ id: CGWindowID) -> Bool {
         guard let list = CGWindowListCopyWindowInfo([.optionIncludingWindow], id) as? [[String: Any]] else {
             return false
@@ -222,9 +346,9 @@ final class WindowTracker {
         return !list.isEmpty
     }
 
-    private func screenBottomSurface(for screen: NSScreen) -> Surface? {
-        guard let displayID = displayID(for: screen), settings.isDisplayEnabled(displayID) else { return nil }
-        return Surface(kind: .screenBottom(displayID: displayID), displayID: displayID, minX: 0, maxX: screen.frame.width, y: 0)
+    private func screenBottomSurface(for screen: ScreenSnapshot) -> Surface? {
+        guard settings.isDisplayEnabled(screen.displayID) else { return nil }
+        return Surface(kind: .screenBottom(displayID: screen.displayID), displayID: screen.displayID, minX: 0, maxX: screen.frame.width, y: 0)
     }
 
     /// A candidate window-surface before occlusion splitting: raw (uninset)
@@ -291,7 +415,7 @@ final class WindowTracker {
             guard width >= minWindowWidth, height >= minWindowHeight else { continue }
 
             guard let screen = screenContaining(cgTopLeftPoint: CGPoint(x: x, y: y)) else { continue }
-            guard let displayID = displayID(for: screen) else { continue }
+            let displayID = screen.displayID
             // Skip building a RawWindow at all for disabled displays — this
             // is what actually saves per-poll cost: the occlusion pass below
             // is O(n^2) over `raws`, so excluding disabled-screen windows
@@ -371,7 +495,7 @@ final class WindowTracker {
             guard width > 0, height > 0 else { continue }
 
             guard let screen = screenContaining(cgTopLeftPoint: CGPoint(x: x, y: y)) else { continue }
-            guard let displayID = displayID(for: screen) else { continue }
+            let displayID = screen.displayID
             guard settings.isDisplayEnabled(displayID) else { continue }
 
             let sceneMinX = x - screen.frame.origin.x
@@ -388,28 +512,26 @@ final class WindowTracker {
         return best?.surface
     }
 
-    /// The physical display id backing an NSScreen, used to tag every
-    /// Surface so OverlayManager can route it to only its own screen's scene.
-    private func displayID(for screen: NSScreen) -> CGDirectDisplayID? {
-        guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
-        return CGDirectDisplayID(number.uint32Value)
-    }
-
     /// CGWindowListCopyWindowInfo reports bounds in a global top-left coordinate
     /// space anchored to the primary display. This returns that display's origin
     /// offset so we can translate into each screen's own top-left space.
-    private func topLeftOffsetY(for screen: NSScreen) -> CGFloat {
-        guard let primary = NSScreen.screens.first else { return 0 }
+    /// Reads `screensSnapshot` (lock-protected) rather than `NSScreen.screens`
+    /// since this runs on the background poll queue.
+    private func topLeftOffsetY(for screen: ScreenSnapshot) -> CGFloat {
+        guard let primary = screensSnapshot.first else { return 0 }
         // Primary screen's top edge sits at global CG y = 0.
         // Other screens' top-left-space offset = primary.maxY - screen.maxY (in AppKit bottom-left coords).
         return primary.frame.maxY - screen.frame.maxY
     }
 
-    private func screenContaining(cgTopLeftPoint point: CGPoint) -> NSScreen? {
-        guard let primary = NSScreen.screens.first else { return nil }
+    /// Reads `screensSnapshot` (lock-protected) rather than `NSScreen.screens`
+    /// since this runs on the background poll queue.
+    private func screenContaining(cgTopLeftPoint point: CGPoint) -> ScreenSnapshot? {
+        let screens = screensSnapshot
+        guard let primary = screens.first else { return nil }
         // Convert CG top-left point to AppKit bottom-left point relative to primary screen.
         let appKitY = primary.frame.maxY - point.y
         let appKitPoint = CGPoint(x: point.x, y: appKitY)
-        return NSScreen.screens.first { $0.frame.contains(appKitPoint) } ?? NSScreen.screens.first
+        return screens.first { $0.frame.contains(appKitPoint) } ?? screens.first
     }
 }

@@ -2,8 +2,37 @@ import Foundation
 import CoreGraphics
 
 enum SnowIntensity: String, CaseIterable, Codable {
-    case light = "조금", normal = "보통", heavy = "펑펑", off = "끄기"
-    var spawnPerSecond: Double { switch self { case .light: 25; case .normal: 80; case .heavy: 220; case .off: 0 } }
+    // Declaration order drives the menu order (StatusBarController populates
+    // from allCases): 끄기 / 조금 / 보통 / 많음 / 펑펑. `.heavy` ("많음") now
+    // carries the old `.blizzard` ("펑펑")'s feel, and the new `.blizzard`
+    // is substantially heavier still (사용자 요청: "진짜 많이 오도록").
+    case off = "끄기", light = "조금", normal = "보통", heavy = "많음", blizzard = "펑펑"
+
+    var spawnPerSecond: Double {
+        switch self {
+        case .off: 0
+        case .light: 25
+        case .normal: 80
+        case .heavy: 220
+        case .blizzard: 660
+        }
+    }
+
+    // Global `maxFlakes` cap used to pin every heavy level to identical
+    // on-screen density (same bug as the spawnAccumulator backlog issue
+    // documented in SnowScene.spawnFlakes) — each intensity now gets its
+    // own cap so density actually differentiates between levels. The flake
+    // pool reuses nodes, so peak allocation this session is just whichever
+    // cap was highest among levels actually selected.
+    var maxFlakes: Int {
+        switch self {
+        case .off: 0
+        case .light: 400
+        case .normal: 600
+        case .heavy: 900
+        case .blizzard: 1500
+        }
+    }
 }
 
 struct Surface: Equatable {
@@ -45,6 +74,11 @@ protocol SnowSceneAPI: AnyObject {
     /// Window closed → drop that surface's snow so it falls and re-accumulates (feature 04).
     func surfaceRemoved(_ surface: Surface)
     func summonSnowplow()
+    /// 블리자드: one-shot ~10s storm burst (ramp-up → full fury → die-down).
+    /// Does NOT change `intensity` — normal spawn/cap/wind resume from the
+    /// current intensity setting once the storm ends. Re-entrant calls while
+    /// a storm is already running are a no-op.
+    func triggerBlizzard()
     /// Teleports 영서 onto the most snow-laden surface and has her sweep it.
     /// Distinct from summonSnowplow(): both can be summoned and active at
     /// once.
@@ -62,6 +96,15 @@ protocol SnowSceneAPI: AnyObject {
     func isInteractive(atScenePoint p: CGPoint) -> Bool
     /// Scoop snow near p. Returns grams scooped (0 = nothing there). Reduces accumulation.
     func scoopSnow(atScenePoint p: CGPoint) -> CGFloat
+    /// Where a bottom-anchored object resting at (x, y) should settle: the
+    /// TOP (baseline + current snow height) of the highest surface whose
+    /// x-range contains x AND whose top sits at/below y (+ small
+    /// tolerance) — i.e. the surface such an object would actually land on
+    /// while falling. Falls back to 0 (scene bottom) when nothing
+    /// qualifies. Used by the interaction layer to make loose snowmen/
+    /// snowballs/partial stacks fall when their support disappears and
+    /// ride a growing pile, mirroring 영서's own live surface-top pin.
+    func restingHeight(atX x: CGFloat, belowY y: CGFloat) -> CGFloat
     /// Interaction layer node container (worker-3 adds its nodes here).
     var interactionDelegate: SnowInteractionDelegate? { get set }
 }
@@ -80,5 +123,10 @@ protocol SnowInteractionDelegate: AnyObject {
     func buildSnowman(atScenePoint p: CGPoint)
     /// True if interaction owns content at p (snowball/snowman hit area).
     func isInteractive(atScenePoint p: CGPoint) -> Bool
+    /// Per-frame tick (called from SnowScene.update, right after the
+    /// sweeper block): lets the interaction layer drop loose objects whose
+    /// support just vanished (gravity fall, landing on `restingHeight`) and
+    /// gently ride a pile that's growing/shrinking beneath them.
+    func tick(dt: TimeInterval)
     func resetAll()
 }

@@ -1,3 +1,4 @@
+import Foundation
 import SpriteKit
 
 /// Concrete SpriteKit scene: falling snow, per-surface accumulation,
@@ -39,7 +40,15 @@ final class SnowScene: SKScene, SnowSceneAPI {
     }
 
     private var flakes: [Flake] = []
-    private let maxFlakes = 400
+    /// Effective flake cap for the CURRENT intensity (see `SnowIntensity.
+    /// maxFlakes`), clamped further in low power mode so a heavy level
+    /// doesn't still render its full density while throttled. The flake
+    /// pool reuses nodes (see `flakePool` below), so peak allocation for the
+    /// process's lifetime is simply the highest cap ever in effect this
+    /// session, not this property's live value.
+    private var maxFlakes: Int {
+        lowPowerMode ? min(intensity.maxFlakes, 500) : intensity.maxFlakes
+    }
     private var spawnAccumulator: Double = 0
     private var lastUpdateTime: TimeInterval?
 
@@ -93,6 +102,36 @@ final class SnowScene: SKScene, SnowSceneAPI {
     private var gustStrength: CGFloat = 0
     private var windVelocity: CGFloat = 0
 
+    // MARK: - Blizzard storm (블리자드 one-shot burst)
+    //
+    // Independent of `intensity`: a ~10s phased burst (ramp-up → full fury →
+    // die-down) that overrides spawn rate/cap/wind for its duration, then
+    // hands control back to whatever the user's selected intensity already
+    // governs. The normal wind-gust state machine above is simply not
+    // ticked while a storm is active (see `update(_:)`), so it resumes
+    // exactly where it left off once the storm ends.
+    private enum BlizzardPhase: Equatable { case none, rampUp, fullFury, dieDown }
+    private var blizzardPhase: BlizzardPhase = .none
+    private var blizzardPhaseElapsed: TimeInterval = 0
+    private var blizzardWindDirection: CGFloat = 1
+    private var blizzardWindMagnitude: CGFloat = 0
+    private let blizzardRampUpDuration: TimeInterval = 2.0
+    private let blizzardFullFuryDuration: TimeInterval = 6.0
+    private let blizzardDieDownDuration: TimeInterval = 2.0
+    /// ~2000/s at full fury; halved in low power mode (cheap guard — storms
+    /// are rare one-shots, no need for finer-grained scaling).
+    private var blizzardSpawnRate: Double { lowPowerMode ? 1000 : 2000 }
+    private var blizzardFlakeCap: Int { lowPowerMode ? 1000 : 2000 }
+    /// Columns are pushed toward this during full fury, not all the way to
+    /// `SnowAccumulator.maxHeight` — "near, not at, the cap" per spec, so
+    /// surfaces read as buried without clipping flush to the ceiling.
+    private static let blizzardSurfaceFillCap: CGFloat = SnowAccumulator.maxHeight * 0.9
+    /// Height units/sec deposited directly onto every column of every
+    /// surface during full fury; tuned against `blizzardFullFuryDuration`
+    /// so a bare surface visibly fills most of the way to the storm cap by
+    /// the time full fury ends.
+    private static let blizzardSurfaceFillRate: CGFloat = 6.5
+
     // displayID 0 is a sentinel: this fallback only exists before the first
     // real updateSurfaces() call (or if WindowTracker couldn't resolve a
     // displayID for this screen). It is never compared against another
@@ -113,7 +152,29 @@ final class SnowScene: SKScene, SnowSceneAPI {
 
     // MARK: - Update loop
 
+    /// Cached once — `ProcessInfo.environment` doesn't change mid-process —
+    /// so the frame-time probe below costs nothing when SNOWMAC_DEBUG isn't set.
+    private static let debugTimingEnabled = ProcessInfo.processInfo.environment["SNOWMAC_DEBUG"] != nil
+    private static var slowFrameCount = 0
+
     override func update(_ currentTime: TimeInterval) {
+        let debugFrameStart = Self.debugTimingEnabled ? Date() : nil
+        defer {
+            // Dev-only probe for diagnosing main-thread stutter (see
+            // Accumulation.swift's rebuild-budget/change-threshold logic,
+            // added for exactly this): logs any update() call over 8ms,
+            // which is where SKShapeNode.path re-tessellation spikes showed
+            // up before that fix. No-op (not even a Date() allocation)
+            // unless SNOWMAC_DEBUG is set.
+            if let debugFrameStart {
+                let elapsedMs = Date().timeIntervalSince(debugFrameStart) * 1000
+                if elapsedMs > 8 {
+                    Self.slowFrameCount += 1
+                    FileHandle.standardError.write("SNOWMAC_DEBUG frame: update()=\(String(format: "%.2f", elapsedMs))ms slowCount=\(Self.slowFrameCount)\n".data(using: .utf8)!)
+                }
+            }
+        }
+
         let dt: TimeInterval
         if let last = lastUpdateTime {
             dt = min(currentTime - last, 0.1)
@@ -124,7 +185,12 @@ final class SnowScene: SKScene, SnowSceneAPI {
 
         guard size.width > 0, size.height > 0, accumulator != nil else { return }
 
-        if !lowPowerMode {
+        if blizzardPhase != .none {
+            // Storm wind fully overrides the ambient gust state machine for
+            // its duration — the machine is simply not ticked, so it
+            // resumes from exactly where it left off once the storm ends.
+            updateBlizzard(dt: dt)
+        } else if !lowPowerMode {
             updateWind(dt: dt)
         }
         spawnFlakes(dt: dt)
@@ -160,6 +226,8 @@ final class SnowScene: SKScene, SnowSceneAPI {
                 }
             }
         }
+
+        interactionDelegate?.tick(dt: dt)
     }
 
     private func updateWind(dt: TimeInterval) {
@@ -196,8 +264,81 @@ final class SnowScene: SKScene, SnowSceneAPI {
         }
     }
 
+    /// Drives the blizzard's 2s ramp-up → 6s full fury → 2s die-down phase
+    /// machine (reusing the wind-gust ramp pattern above), overriding
+    /// `windVelocity` directly, and depositing extra mass onto every
+    /// surface during full fury. `spawnFlakes`/`spawnFlake` separately
+    /// check `blizzardPhase` to override spawn rate/cap/position/speed.
+    private func updateBlizzard(dt: TimeInterval) {
+        blizzardPhaseElapsed += dt
+        switch blizzardPhase {
+        case .none:
+            return
+        case .rampUp:
+            let t = min(blizzardPhaseElapsed / blizzardRampUpDuration, 1.0)
+            windVelocity = blizzardWindDirection * blizzardWindMagnitude * CGFloat(t)
+            guard blizzardPhaseElapsed >= blizzardRampUpDuration else { return }
+            blizzardPhase = .fullFury
+            blizzardPhaseElapsed = 0
+        case .fullFury:
+            windVelocity = blizzardWindDirection * blizzardWindMagnitude
+            depositBlizzardMassOnAllSurfaces(dt: dt)
+            guard blizzardPhaseElapsed >= blizzardFullFuryDuration else { return }
+            blizzardPhase = .dieDown
+            blizzardPhaseElapsed = 0
+        case .dieDown:
+            let t = min(blizzardPhaseElapsed / blizzardDieDownDuration, 1.0)
+            windVelocity = blizzardWindDirection * blizzardWindMagnitude * (1 - CGFloat(t))
+            guard blizzardPhaseElapsed >= blizzardDieDownDuration else { return }
+            // Storm over: hand back to whatever the current intensity
+            // already governs. windVelocity/spawn rate/cap all read
+            // `blizzardPhase` elsewhere, so resetting it to `.none` here is
+            // the single switch that restores normal behavior.
+            blizzardPhase = .none
+            blizzardPhaseElapsed = 0
+            windVelocity = 0
+        }
+    }
+
+    /// Directly deposits mass onto every column of every tracked surface
+    /// (not routed through falling flakes at all) so surfaces visibly bury
+    /// within the full-fury window regardless of how long an individual
+    /// flake takes to fall and land. Clamped to `blizzardSurfaceFillCap`
+    /// ("near, not at" `SnowAccumulator.maxHeight`) rather than the real
+    /// deposit cap, so storm filling never flush-caps a surface.
+    private func depositBlizzardMassOnAllSurfaces(dt: TimeInterval) {
+        guard accumulator != nil else { return }
+        let amount = Self.blizzardSurfaceFillRate * CGFloat(dt)
+        for state in accumulator.states {
+            for i in 0..<state.heights.count where state.heights[i] < Self.blizzardSurfaceFillCap {
+                state.heights[i] = min(state.heights[i] + amount, Self.blizzardSurfaceFillCap)
+            }
+        }
+    }
+
+    /// Spawn rate for the CURRENT instant: the intensity-driven rate while
+    /// no storm is running, otherwise ramped in lockstep with the wind
+    /// (same t as `updateBlizzard`'s phase ramps) so the storm's density
+    /// builds up and winds down rather than snapping instantly, matching
+    /// the "build-up"/"die-down" phase names.
+    private var effectiveSpawnRate: Double {
+        let base = intensity.spawnPerSecond * (lowPowerMode ? 0.3 : 1.0)
+        switch blizzardPhase {
+        case .none:
+            return base
+        case .rampUp:
+            let t = min(blizzardPhaseElapsed / blizzardRampUpDuration, 1.0)
+            return base + (blizzardSpawnRate - base) * t
+        case .fullFury:
+            return blizzardSpawnRate
+        case .dieDown:
+            let t = min(blizzardPhaseElapsed / blizzardDieDownDuration, 1.0)
+            return blizzardSpawnRate + (base - blizzardSpawnRate) * t
+        }
+    }
+
     private func spawnFlakes(dt: TimeInterval) {
-        let rate = intensity.spawnPerSecond * (lowPowerMode ? 0.3 : 1.0)
+        let rate = effectiveSpawnRate
         guard rate > 0 else { return }
         spawnAccumulator += rate * dt
         // Bound the backlog to at most one flake's worth instead of letting
@@ -212,15 +353,35 @@ final class SnowScene: SKScene, SnowSceneAPI {
         // falling snow, worst right after lowering intensity (low rate =>
         // long stall), and most noticeable soon after launch when the
         // initial burst of near-simultaneously-spawned flakes tends to land
-        // in a synchronized wave, freeing many slots at once. Clamping to 1
+        // in a synchronized wave, freeing many slots at once. Clamping
         // keeps growth bounded (still no mask-the-cap burst) while letting
-        // the very next freed slot refill immediately rather than stalling,
-        // and lets density converge smoothly to the new rate afterward.
-        spawnAccumulator = min(spawnAccumulator, 1.0)
-        while spawnAccumulator >= 1, flakes.count < maxFlakes {
+        // the very next freed slot refill immediately rather than stalling.
+        //
+        // The clamp bound must be ONE FRAME'S WORTH at the current rate,
+        // not a flat 1.0: a flat 1.0 silently capped spawning at one flake
+        // per update (~60/s), which flattened every rate above ~60 — 보통
+        // (80), 많음 (220), 펑펑 (660), and the blizzard override (2000)
+        // all produced identical ~60/s snowfall, so the heavy levels never
+        // actually differentiated.
+        spawnAccumulator = min(spawnAccumulator, max(1.0, Double(rate) * dt))
+        let cap = blizzardPhase == .none ? maxFlakes : blizzardFlakeCap
+        while spawnAccumulator >= 1, flakes.count < cap {
             spawnAccumulator -= 1
             spawnFlake()
         }
+    }
+
+    /// Normal spawn position: random x along the top edge. During an
+    /// active storm, roughly half of flakes instead enter from the
+    /// windward screen edge (the side the storm wind blows FROM) at a
+    /// random height, so the sustained lateral wind visibly fills the sky
+    /// from the side too, not just from above.
+    private func spawnPosition() -> CGPoint {
+        guard blizzardPhase != .none, Bool.random() else {
+            return CGPoint(x: CGFloat.random(in: 0...size.width), y: size.height + CGFloat.random(in: 0...20))
+        }
+        let windwardX: CGFloat = blizzardWindDirection > 0 ? 0 : size.width
+        return CGPoint(x: windwardX, y: CGFloat.random(in: 0...size.height))
     }
 
     private func spawnFlake() {
@@ -228,11 +389,18 @@ final class SnowScene: SKScene, SnowSceneAPI {
         let node = dequeueFlakeNode()
         node.size = CGSize(width: radius * 2, height: radius * 2)
         node.alpha = CGFloat.random(in: 0.55...0.95)
-        node.position = CGPoint(x: CGFloat.random(in: 0...size.width), y: size.height + CGFloat.random(in: 0...20))
+        node.position = spawnPosition()
         node.zPosition = 10
         node.isHidden = false
 
-        let speed = CGFloat.random(in: 18...52) * (radius / 1.8)
+        // 펑펑 flakes fall noticeably faster than the other levels, so the
+        // extra density reads as driving snow in the air rather than a
+        // static wall, and so density actually differentiates from 많음.
+        // An active storm layers its own, larger boost on top, independent
+        // of the currently selected intensity.
+        let speedBoost: CGFloat = intensity == .blizzard ? CGFloat.random(in: 1.25...1.35) : 1.0
+        let stormBoost: CGFloat = blizzardPhase == .none ? 1.0 : CGFloat.random(in: 1.5...2.0)
+        let speed = CGFloat.random(in: 18...52) * (radius / 1.8) * speedBoost * stormBoost
         let flake = Flake(
             node: node,
             velocityY: -speed,
@@ -533,6 +701,19 @@ final class SnowScene: SKScene, SnowSceneAPI {
         driveNextPlowSurface(first)
     }
 
+    /// 블리자드: one-shot storm. Re-entrant while already running is a no-op
+    /// (blizzardPhase != .none guards it) — does not touch `intensity` at
+    /// all; `updateBlizzard`/`spawnFlakes`/`spawnFlake` key off
+    /// `blizzardPhase` to override behavior for the run's duration, then
+    /// hand control straight back to whatever `intensity` already governs.
+    func triggerBlizzard() {
+        guard accumulator != nil, blizzardPhase == .none else { return }
+        blizzardPhase = .rampUp
+        blizzardPhaseElapsed = 0
+        blizzardWindDirection = Bool.random() ? 1 : -1
+        blizzardWindMagnitude = CGFloat.random(in: 180...250)
+    }
+
     /// Picks the next surface for the plow chain: the most-laden surface
     /// still holding at least `meaningfulSnowThreshold`, screenBottom
     /// included (see historical note below on why screenBottom isn't
@@ -593,6 +774,34 @@ final class SnowScene: SKScene, SnowSceneAPI {
     private var sweeperInFlight = false
     private var sweeper: SweeperCharacter?
 
+    /// 분노의 눈덩이 splat nodes handed off by SweeperCharacter (see its
+    /// `onRageSplat`/`landRageSplat` docs) — each one's ~10s fade-and-remove
+    /// runs here via `beginRageSplatLifecycle`, independent of the
+    /// SweeperCharacter instance that spawned it (which may already be gone
+    /// by the time the fade finishes). `resetAllSnow()` clears this array
+    /// directly so an in-flight splat is removed immediately even with no
+    /// sweeper left to ask.
+    private var activeRageSplats: [SKNode] = []
+    /// How slowly a rage splat fades once it lands — kept here (not in
+    /// SweeperCharacter) since this scene, not she, owns the splat's
+    /// lifecycle after handoff.
+    private static let rageSplatFadeDuration: TimeInterval = 10.0
+
+    /// Takes ownership of a freshly-landed rage splat: tracks it (for
+    /// cancel-safety) and starts its slow fade-out/removal, which keeps
+    /// running to completion regardless of what happens to the
+    /// SweeperCharacter that created it.
+    private func beginRageSplatLifecycle(_ splat: SKNode) {
+        activeRageSplats.append(splat)
+        let fade = SKAction.sequence([
+            .fadeAlpha(to: 0, duration: Self.rageSplatFadeDuration),
+            .removeFromParent()
+        ])
+        splat.run(fade) { [weak self] in
+            self?.activeRageSplats.removeAll { $0 === splat }
+        }
+    }
+
     /// 영서 소환: teleports her onto the most snow-laden surface (screenBottom
     /// included) and starts her push-mound sweep.
     func summonSweeper() {
@@ -606,6 +815,9 @@ final class SnowScene: SKScene, SnowSceneAPI {
             target: target,
             spawnClump: { [weak self] point, amount in
                 self?.spawnClump(at: point, amount: amount)
+            },
+            onRageSplat: { [weak self] splat in
+                self?.beginRageSplatLifecycle(splat)
             }
         ) { [weak self] in
             self?.sweeperInFlight = false
@@ -624,6 +836,17 @@ final class SnowScene: SKScene, SnowSceneAPI {
     /// normal lazy-sweep routine.
     func summonSweeperForSnowman() {
         guard accumulator != nil else { return }
+        // If she's ALREADY summoned (영서 소환), the request isn't ignored:
+        // she drops whatever she was doing and poof-teleports back in build
+        // mode — consistent with her teleport language, and far simpler
+        // than mutating her (deliberately immutable) mode mid-run. Only a
+        // rage throw in progress or being held/falling blocks the switch.
+        if let sweeper {
+            guard !sweeper.isAirborne, !sweeper.isRaging else { return }
+            sweeper.cancel()
+            self.sweeper = nil
+            sweeperInFlight = false
+        }
         guard !sweeperInFlight else { return }
         guard let target = accumulator.mostLadenSurface() else { return }
         sweeperInFlight = true
@@ -656,6 +879,11 @@ final class SnowScene: SKScene, SnowSceneAPI {
         sweeper?.cancel()
         sweeper = nil
         sweeperInFlight = false
+        // In-flight rage splats are owned by this scene, not by `sweeper`
+        // (see activeRageSplats' doc) — remove them directly so a reset
+        // mid-fade never leaves one lingering on screen.
+        for splat in activeRageSplats { splat.removeFromParent() }
+        activeRageSplats.removeAll()
         interactionDelegate?.resetAll()
     }
 
@@ -677,6 +905,15 @@ final class SnowScene: SKScene, SnowSceneAPI {
     func scoopSnow(atScenePoint p: CGPoint) -> CGFloat {
         guard accumulator != nil else { return 0 }
         return accumulator.scoop(atScenePoint: p)
+    }
+
+    /// Same shape as a falling flake's landing rule — reuses
+    /// `landingSurface(atX:belowY:)` directly rather than duplicating its
+    /// per-surface scan — so a resting object and a falling flake agree on
+    /// exactly which surface counts as "below" at a given point.
+    func restingHeight(atX x: CGFloat, belowY y: CGFloat) -> CGFloat {
+        guard accumulator != nil else { return 0 }
+        return landingSurface(atX: x, belowY: y)?.top ?? 0
     }
 
     // MARK: - Mouse forwarding

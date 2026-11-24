@@ -27,9 +27,11 @@ final class SweeperCharacter {
 
     /// Which routine she runs once summoned. `.sweep` (the default, used by
     /// every existing call site) is the normal lazy-worker sweep/clear loop.
-    /// `.buildSnowman` (영서에게 눈사람 부탁) instead runs a short fixed
-    /// gather stint with no quirks/rest/stroll, then hands off to assemble a
-    /// snowman — see `beginSweeping()`/`advanceSweepSegment(dt:)`.
+    /// `.buildSnowman` (영서에게 눈사람 부탁) instead rolls two growing
+    /// snowballs (big -> small) over to a chosen build spot and
+    /// stacks them there, no quirks/rest/stroll along the way, then hands
+    /// off to assemble the real snowman at the same spot — see
+    /// `beginSweeping()`/`beginBuild()`/`advanceBuild(dt:)`.
     enum Mode {
         case sweep
         case buildSnowman
@@ -53,6 +55,25 @@ final class SweeperCharacter {
         case sweeping
         case strolling
         case resting
+    }
+
+    /// `.buildSnowman` mode's own sub-state machine for a single ball — see
+    /// `beginBuildWalkAway()`/`beginBuildRolling()`/`beginBuildPlacing()`.
+    /// Entirely separate from `Activity` above (the two modes never run at
+    /// once on one instance), driven by `advanceBuild(dt:)` instead of the
+    /// `Activity` switch in `update(dt:)`.
+    private enum BuildPhase {
+        /// Walking a short stretch away from the build spot before turning
+        /// around to roll back toward it — reuses `idleTextures` at a walk
+        /// pace, same look as a lazy-mode stroll.
+        case walkingAway
+        /// Walking back toward the build spot while pushing/growing the
+        /// prop snowball ahead of her feet.
+        case rolling
+        /// Ball just reached the build spot; for balls 2 and 3 this plays a
+        /// brief lift-and-place hop onto the stack before the next ball
+        /// (or the final handoff) begins.
+        case placing
     }
 
     /// Rendered height of the character, in points; each frame's width is
@@ -84,12 +105,70 @@ final class SweeperCharacter {
     /// this always eventually terminates on its own.
     private static let finishThreshold: CGFloat = 8
 
-    /// `.buildSnowman` mode's fixed gather stint length — she's on a
-    /// mission, not lazing through the normal activity roll.
-    private static let buildStintDuration: ClosedRange<TimeInterval> = 3...5
-    /// `.buildSnowman` mode's post-stint consumption: span (centered on her
-    /// feet) cleared from the accumulator, on top of her carriedSnow.
-    private static let buildSnowmanClearSpan: CGFloat = 60
+    /// `.buildSnowman` mode's 2 prop-snowball target radii, big -> small
+    /// (ball 1/2) — deliberately matching InteractionController's 2-tier
+    /// `builtSnowmanBaseRadius`/`HeadRadius` (30/18) so the real snowman
+    /// that pops in at the end lands at the exact same size as the props
+    /// it's replacing; keep the two in sync if either changes. Only 2
+    /// balls (base + head, no torso): a 3-tier 영서 build read as too
+    /// tall/unsettling to the user ("너무 징그러워"). The resulting 2-tier
+    /// snowman can still be upgraded to 3-tier afterward by dropping a
+    /// ball on it, same as any other 2-tier snowman.
+    private static let buildBallTargetRadii: [CGFloat] = [30, 18]
+    /// Every prop ball is "born" tiny and grows toward its target radius as
+    /// she rolls it (see `advanceBuildRolling(dt:)`).
+    private static let buildBallStartRadius: CGFloat = 3
+    /// Distance from her arrival point to the chosen build spot, and each
+    /// ball's walk-away-and-back stretch. Absolute points, NOT a span
+    /// fraction (screenBottom's span can be the full screen width, which a
+    /// percentage-based stretch would blow the whole sequence's ~8-14s
+    /// budget on) — same reasoning as `lazySpeedRange` staying absolute.
+    private static let buildSpotOffsetRange: ClosedRange<CGFloat> = 70...130
+    private static let buildWalkAwayRange: ClosedRange<CGFloat> = 35...70
+    /// Minimum clearance kept between the chosen build spot and either
+    /// surface edge, so the stacked snowman never ends up flush against one.
+    private static let buildSpotMargin: CGFloat = 40
+    /// Lift-and-place hop duration for balls 2 and 3 once their roll reaches
+    /// the build spot (ball 1 just settles in place as the base — no hop).
+    private static let buildPlaceHopDuration: TimeInterval = 0.4
+
+    // MARK: - Rage (분노의 눈덩이 투척)
+
+    /// Once her carried (overflowed-while-pushing) snow crosses this, the
+    /// surface she's sweeping is considered SO maxed out she can't push it
+    /// anywhere anymore — `pushSnow` keeps returning nearly everything as
+    /// overflow — and she rages instead of continuing the lazy loop, in
+    /// `.sweep` mode only (`.buildSnowman` never calls `advanceSweepSegment`,
+    /// where this is checked, so it never rages). `carriedSnow` is a direct
+    /// proxy for "stuck": it only grows while a push overflows, so it stays
+    /// near 0 during ordinary sweeping (her push window ahead still has
+    /// room) and climbs quickly once the pile immediately ahead saturates.
+    private static let rageCarriedSnowThreshold: CGFloat = 60
+    /// Pack pose hold duration (step 2 of the sequence) — also how long the
+    /// prop ball takes to pop up to its packed size.
+    private static let ragePackHoldDuration: TimeInterval = 0.6
+    /// Hold duration for each of the two generated packing frames (throw_0
+    /// then throw_1) — only used when the throw sprite set loaded; see
+    /// `beginRagePack()`. Independent of `ragePackHoldDuration` above
+    /// (which still times the placeholder-frame fallback and the prop
+    /// ball's pop-up animation).
+    private static let rageThrowFrameHoldDuration: TimeInterval = 0.5
+    /// Wind-up pose (throw_2) hold before the throw launches — only used
+    /// when the throw sprite set loaded; see `beginRageThrow()`.
+    private static let rageWindupHoldDuration: TimeInterval = 0.4
+    private static let rageBallPackedRadiusRange: ClosedRange<CGFloat> = 8...10
+    private static let rageThrowDurationRange: ClosedRange<TimeInterval> = 0.5...0.7
+    private static let rageBallThrowScaleRange: ClosedRange<CGFloat> = 25...40
+    /// Random offset magnitude (each axis, sign rolled separately) added to
+    /// scene center to pick the impact point, before clamping into bounds.
+    private static let rageImpactOffsetRange: ClosedRange<CGFloat> = 10...1024
+    private static let rageImpactEdgeInset: CGFloat = 40
+    private static let rageSplatAlpha: CGFloat = 0.92
+    /// Her own fade (step 5) — longer than the normal 0.4s finish fade
+    /// (`fadeOutAndDespawn`'s default) since it must stay in sync with the
+    /// splat's own much slower ~10s fade, which SnowScene starts the same
+    /// instant (see `landRageSplat`).
+    private static let rageSelfFadeDurationRange: ClosedRange<TimeInterval> = 1.5...2.0
 
     // MARK: - Texture loading
 
@@ -201,6 +280,7 @@ final class SweeperCharacter {
         mode: Mode = .sweep,
         spawnClump: @escaping (CGPoint, CGFloat) -> Void,
         onBuildSnowman: ((CGPoint) -> Void)? = nil,
+        onRageSplat: @escaping (SKNode) -> Void = { _ in },
         onFinish: @escaping () -> Void
     ) -> SweeperCharacter? {
         guard
@@ -217,6 +297,12 @@ final class SweeperCharacter {
             }
             return nil
         }
+        // Newer, optional sprite sets — nil (NOT a summon failure) on a
+        // bundle built before these existed. Every call site that uses one
+        // falls back to the pre-existing look when it's nil.
+        let rollLRTextures = textures(prefix: "roll_lr", count: 4)
+        let rollRLTextures = textures(prefix: "roll_rl", count: 4)
+        let throwTextures = textures(prefix: "throw", count: 4)
 
         // Start from whichever end holds less snow, so she sweeps toward
         // (and builds her mound into) the heavier end — reads more natural
@@ -242,8 +328,12 @@ final class SweeperCharacter {
             lookTextures: lookTextures,
             sulkTextures: sulkTextures,
             miscTextures: miscTextures,
+            rollLRTextures: rollLRTextures,
+            rollRLTextures: rollRLTextures,
+            throwTextures: throwTextures,
             spawnClump: spawnClump,
             onBuildSnowman: onBuildSnowman,
+            onRageSplat: onRageSplat,
             onFinish: onFinish
         )
     }
@@ -257,13 +347,51 @@ final class SweeperCharacter {
     /// her position right before she steps aside. Always nil in `.sweep`
     /// mode.
     private let onBuildSnowman: ((CGPoint) -> Void)?
-    /// Counts down the fixed gather stint in `.buildSnowman` mode; set by
-    /// `beginSweeping()`, ticked in `advanceSweepSegment(dt:)`. Unused in
-    /// `.sweep` mode.
-    private var buildStintRemaining: TimeInterval = 0
+    /// `.buildSnowman` mode's own sub-state machine — see `BuildPhase`.
+    /// Unused in `.sweep` mode.
+    private var buildPhase: BuildPhase = .walkingAway
+    /// Which of the 2 balls (0 = big/base, 1 = small/head) is currently
+    /// in progress.
+    private var buildIndex = 0
+    /// The x she picked (once, in `beginBuild()`) to roll both balls to.
+    private var buildSpotX: CGFloat = 0
+    /// `walkX` at the moment the CURRENT ball's rolling pass began — the
+    /// denominator for the roll-progress-driven growth in
+    /// `advanceBuildRolling(dt:)`.
+    private var buildRollStartX: CGFloat = 0
+    /// The ball x (leading-edge, same offset as the sweep shovel) last
+    /// fed into the accumulator strip-clear — the window this tick's
+    /// `clearRange` call spans, mirroring `lastShovelX`'s role for sweeping.
+    private var buildLastFeedX: CGFloat = 0
+    /// Countdown for the current ball's lift-and-place hop (balls 2/3
+    /// only); reaching zero advances to the next ball or the handoff.
+    private var buildPlaceRemaining: TimeInterval = 0
+    /// The ball currently being rolled, if any — nil during `.walkingAway`/
+    /// `.placing`. Registered in `activeEffects` so `cancel()` cleans it up
+    /// for free.
+    private var buildBallNode: SKShapeNode?
+    /// True while the CURRENT roll is showing a generated roll sprite
+    /// (rather than the idle-frames fallback) — that sheet already draws a
+    /// snowball in her hands, so the code-drawn prop ball underneath is
+    /// hidden (alpha 0) for the duration to avoid two balls rendering at
+    /// once. The prop keeps tracking size/position/physics throughout
+    /// regardless, so it can simply pop back to visible (alpha 1) the
+    /// instant she reaches the build spot — see `beginBuildRolling()` and
+    /// `advanceBuildRolling(dt:)`.
+    private var buildBallHiddenForRollSprite = false
+    /// Balls already rolled into place at the build spot (base first, then
+    /// stacked upward), kept around until `finishBuildSnowman()` pops them
+    /// all at once for the real-snowman handoff. Also registered in
+    /// `activeEffects`.
+    private var buildPlacedBalls: [SKShapeNode] = []
     /// The surface she's sweeping — exposed so SnowScene can compare it
     /// (by reference) against the plow's current surface for the
     /// plow-passes-her interaction.
+    /// Hands a freshly-landed rage splat composition to SnowScene — see the
+    /// doc at `landRageSplat` for why ownership must transfer there instead
+    /// of staying in this instance's `activeEffects`. Defaults to a no-op
+    /// since `.buildSnowman` mode never rages and never calls this.
+    private let onRageSplat: (SKNode) -> Void
     private(set) var surfaceState: SnowAccumulator.SurfaceState
     /// Her nominal/overall direction, fixed for the whole run — only used
     /// to pick which edge the final mound settles against
@@ -300,6 +428,12 @@ final class SweeperCharacter {
     private let lookTextures: [SKTexture]
     private let sulkTextures: [SKTexture]
     private let miscTextures: [SKTexture]
+    /// Optional newer sprite sets — nil on a bundle built before they
+    /// existed; every call site that uses one falls back to the
+    /// pre-existing look (idle/misc placeholder) when nil.
+    private let rollLRTextures: [SKTexture]?
+    private let rollRLTextures: [SKTexture]?
+    private let throwTextures: [SKTexture]?
 
     private var walkAnim: FrameSequence
     /// Non-nil while a one-shot (or held) foreground animation is playing —
@@ -384,6 +518,22 @@ final class SweeperCharacter {
     /// self-remove on their own schedule.
     private var activeEffects: [SKNode] = []
 
+    /// Latches once 분노의 눈덩이 fires so it never fires twice in the same
+    /// summon — see `rageCarriedSnowThreshold`'s doc. Also reused to block
+    /// the plow/poke interrupt reactions once she's mid-rage (see
+    /// `notifyPlowProximity`/`poke`), since either would clobber the
+    /// pack/throw overlay chain and orphan `rageBallNode`.
+    private var hasRaged = false
+    /// Whether the rage throw sequence has begun (it latches and runs to
+    /// her exit) — exposed so SnowScene can refuse to interrupt it (e.g.
+    /// a 눈사람 부탁 while she's mid-throw just lets the rage play out).
+    var isRaging: Bool { hasRaged }
+    /// The packed/thrown snowball prop, while still owned by her (also
+    /// tracked in `activeEffects`, so `cancel()` removes it for free if
+    /// interrupted mid-flight). Set to nil the instant it's replaced by the
+    /// splat in `landRageSplat`.
+    private var rageBallNode: SKShapeNode?
+
     private init(
         parent: SKNode,
         accumulator: SnowAccumulator,
@@ -397,8 +547,12 @@ final class SweeperCharacter {
         lookTextures: [SKTexture],
         sulkTextures: [SKTexture],
         miscTextures: [SKTexture],
+        rollLRTextures: [SKTexture]?,
+        rollRLTextures: [SKTexture]?,
+        throwTextures: [SKTexture]?,
         spawnClump: @escaping (CGPoint, CGFloat) -> Void,
         onBuildSnowman: ((CGPoint) -> Void)?,
+        onRageSplat: @escaping (SKNode) -> Void,
         onFinish: @escaping () -> Void
     ) {
         self.accumulator = accumulator
@@ -407,6 +561,7 @@ final class SweeperCharacter {
         self.currentTravel = travel
         self.mode = mode
         self.onBuildSnowman = onBuildSnowman
+        self.onRageSplat = onRageSplat
         self.columnStep = travel == .leftToRight ? 1 : -1
         self.startX = travel == .leftToRight ? state.surface.minX : state.surface.maxX
         self.lastSurfaceMinX = state.surface.minX
@@ -419,6 +574,9 @@ final class SweeperCharacter {
         self.lookTextures = lookTextures
         self.sulkTextures = sulkTextures
         self.miscTextures = miscTextures
+        self.rollLRTextures = rollLRTextures
+        self.rollRLTextures = rollRLTextures
+        self.throwTextures = throwTextures
         // Placeholder until beginSweeping() kicks off the first real
         // segment once the arrival poof finishes; never rendered as-is.
         self.walkAnim = FrameSequence(frames: idleTextures, timePerFrame: 0.25, loops: true)
@@ -479,6 +637,17 @@ final class SweeperCharacter {
                 currentX = clampToSurface(currentX + dx)
                 lastShovelX += dx
                 segmentTargetX = clampToSurface(segmentTargetX + dx)
+                if mode == .buildSnowman {
+                    // Keep the build spot, the current roll's progress
+                    // baseline, and every prop ball (in-flight or already
+                    // stacked) riding along with the window too — none of
+                    // these are covered by the x-state above.
+                    buildSpotX += dx
+                    buildRollStartX += dx
+                    buildLastFeedX += dx
+                    buildBallNode?.position.x += dx
+                    for ball in buildPlacedBalls { ball.position.x += dx }
+                }
                 node.position.x = currentX
             } else {
                 // Width-only resize (minX unchanged): just keep her inside.
@@ -530,8 +699,17 @@ final class SweeperCharacter {
             return
         }
 
-        if surfaceState.heights.reduce(0, +) < Self.finishThreshold {
+        // `.buildSnowman` mode doesn't terminate on remaining-snow totals —
+        // it has its own fixed completion criterion (2 balls placed) — and
+        // its rolling pass actively consumes snow via clearRange, which this
+        // threshold would otherwise trip well before the sequence is done.
+        if mode != .buildSnowman, surfaceState.heights.reduce(0, +) < Self.finishThreshold {
             beginFinish(aborted: false)
+            return
+        }
+
+        if mode == .buildSnowman {
+            advanceBuild(dt: dt)
             return
         }
 
@@ -574,10 +752,9 @@ final class SweeperCharacter {
         isWorking = true
         activeTime = 0
         if mode == .buildSnowman {
-            // On a mission: no landing quirk, straight into the fixed
-            // gather stint (advanceSweepSegment ticks it down).
-            buildStintRemaining = .random(in: Self.buildStintDuration)
-            beginSweepSegment(direction: currentTravel)
+            // On a mission: no landing quirk, straight into picking the
+            // build spot and rolling the first (biggest) ball toward it.
+            beginBuild()
             return
         }
         beginSweepSegment(direction: currentTravel)
@@ -607,7 +784,7 @@ final class SweeperCharacter {
         // or a direction switch crossed without sweeping.
         lastShovelX = walkX + segmentSign * shovelOffset
         let frames = direction == .leftToRight ? sweepLRTextures : sweepRLTextures
-        walkAnim = FrameSequence(frames: frames, timePerFrame: 0.14, loops: true)
+        walkAnim = FrameSequence(frames: frames, timePerFrame: 0.3, loops: true)
         // A fresh stroke always STARTS by showing the shoveling look;
         // advanceSweepSegment corrects this within a tick or two if the
         // ground right there turns out to already be bare.
@@ -673,6 +850,256 @@ final class SweeperCharacter {
         return reached
     }
 
+    // MARK: - Build-a-snowman (rolling balls)
+
+    /// Picks the build spot once (a point `buildSpotOffsetRange` away from
+    /// her arrival point, in her nominal travel direction — i.e. further
+    /// onto the surface, away from the edge she teleported onto — clamped
+    /// so it never ends up within `buildSpotMargin` of either edge), then
+    /// kicks off ball 1's walk-away leg.
+    private func beginBuild() {
+        let offset = CGFloat.random(in: Self.buildSpotOffsetRange)
+        let rawSpot = walkX + travelSign * offset
+        let margin = min(Self.buildSpotMargin, span * 0.3)
+        let lo = surfaceMinX + margin
+        let hi = surfaceMaxX - margin
+        buildSpotX = lo <= hi ? min(max(rawSpot, lo), hi) : (surfaceMinX + surfaceMaxX) / 2
+        buildIndex = 0
+        beginBuildWalkAway()
+    }
+
+    /// Ball `buildIndex`'s pre-roll leg: walk a random short stretch away
+    /// from `buildSpotX` (whichever side she's currently on; a coin flip if
+    /// she's exactly on it), then `advanceBuild(dt:)` turns her around into
+    /// `beginBuildRolling()` once `advanceWalk` reports the stretch is done.
+    private func beginBuildWalkAway() {
+        buildPhase = .walkingAway
+        currentSpeed = .random(in: Self.lazySpeedRange)
+        let stretch = CGFloat.random(in: Self.buildWalkAwayRange)
+        let awaySign: CGFloat
+        if walkX > buildSpotX { awaySign = 1 }
+        else if walkX < buildSpotX { awaySign = -1 }
+        else { awaySign = Bool.random() ? 1 : -1 }
+        segmentSign = awaySign
+        segmentTargetX = clampToSurface(walkX + awaySign * stretch)
+        walkAnim = FrameSequence(frames: idleTextures, timePerFrame: 0.2, loops: true)
+    }
+
+    /// Turns around and starts rolling ball `buildIndex` back toward
+    /// `buildSpotX`, spawning its (initially tiny) prop node at her leading
+    /// edge.
+    private func beginBuildRolling() {
+        buildPhase = .rolling
+        currentSpeed = .random(in: Self.lazySpeedRange)
+        buildRollStartX = walkX
+        segmentSign = buildSpotX >= walkX ? 1 : -1
+        segmentTargetX = buildSpotX
+        // Rolling toward the build spot: use the direction-matched roll
+        // sheet (roll_lr when heading right, roll_rl when heading left) if
+        // it loaded; older bundles without it fall back to the idle look,
+        // same as before this sheet existed.
+        if let rollFrames = segmentSign > 0 ? rollLRTextures : rollRLTextures {
+            walkAnim = FrameSequence(frames: rollFrames, timePerFrame: 0.22, loops: true)
+            buildBallHiddenForRollSprite = true
+        } else {
+            walkAnim = FrameSequence(frames: idleTextures, timePerFrame: 0.2, loops: true)
+            buildBallHiddenForRollSprite = false
+        }
+
+        buildLastFeedX = walkX + segmentSign * shovelOffset
+        guard let parent = node.parent else { return }
+        let targetRadius = Self.buildBallTargetRadii[buildIndex]
+        let ball = makeBuildBallNode(radius: targetRadius)
+        ball.setScale(Self.buildBallStartRadius / targetRadius)
+        // When the roll sheet is active it already draws a snowball in her
+        // hands — hide this code-drawn prop underneath it so the two don't
+        // double up visually. The prop keeps growing/tracking position
+        // every tick regardless (see advanceBuildRolling(dt:)), so it can
+        // simply fade back in the instant she reaches the build spot,
+        // where it becomes the visible stacked ball.
+        ball.alpha = buildBallHiddenForRollSprite ? 0 : 1
+        ball.position = CGPoint(x: buildLastFeedX, y: accumulator.topY(of: surfaceState, atX: buildLastFeedX) + Self.buildBallStartRadius)
+        ball.zPosition = node.zPosition - 1
+        parent.addChild(ball)
+        activeEffects.append(ball)
+        buildBallNode = ball
+    }
+
+    /// A plain white circle standing in for a snowball she's pushing — no
+    /// dedicated rolling sprite exists yet (see the SEAM comment in
+    /// `beginBuildRolling()`). Built at its FINAL target radius with a
+    /// couple of off-center dots as children, then grown/shrunk via
+    /// `setScale` elsewhere — that keeps the dots correctly proportioned
+    /// at every size and makes the zRotation applied while rolling actually
+    /// read as rolling instead of a static disc.
+    private func makeBuildBallNode(radius: CGFloat) -> SKShapeNode {
+        let ball = SKShapeNode(circleOfRadius: radius)
+        ball.fillColor = .white
+        ball.strokeColor = SKColor(white: 0.85, alpha: 1)
+        ball.lineWidth = 1
+        for _ in 0..<2 {
+            let dot = SKShapeNode(circleOfRadius: max(radius * 0.16, 1))
+            dot.fillColor = SKColor(white: 0.78, alpha: 0.7)
+            dot.strokeColor = .clear
+            dot.position = CGPoint(x: CGFloat.random(in: -radius * 0.4...radius * 0.4), y: CGFloat.random(in: -radius * 0.4...radius * 0.4))
+            ball.addChild(dot)
+        }
+        return ball
+    }
+
+    /// Dispatches to whichever build sub-phase is active; called from
+    /// `update(dt:)` in place of the `Activity` switch while
+    /// `mode == .buildSnowman`. Like that switch, this is simply never
+    /// reached while `overlay` is set or `isWorking` is false, which is
+    /// what makes the whole build pausable/resumable by the hurt/angry
+    /// reaction exactly like a sweep segment.
+    private func advanceBuild(dt: TimeInterval) {
+        switch buildPhase {
+        case .walkingAway:
+            if advanceWalk(dt: dt) {
+                beginBuildRolling()
+            }
+        case .rolling:
+            advanceBuildRolling(dt: dt)
+        case .placing:
+            advanceBuildPlacing(dt: dt)
+        }
+    }
+
+    /// Walks toward `buildSpotX` while growing the rolling ball in step
+    /// with how far she's come (so it always starts tiny and reaches its
+    /// full target radius exactly as she arrives, regardless of how long
+    /// this particular roll turned out to be), keeping it pinned to her
+    /// leading edge and resting on the live snow top, spinning it slightly,
+    /// and clearing the thin strip of accumulation it just rolled over —
+    /// snow visibly feeding the ball, the same "shovel strip" shape as
+    /// `advanceSweepSegment`'s push, just consumed instead of pushed.
+    private func advanceBuildRolling(dt: TimeInterval) {
+        let reached = advanceWalk(dt: dt)
+        guard let ball = buildBallNode else {
+            if reached { beginBuildPlacing() }
+            return
+        }
+
+        let targetRadius = Self.buildBallTargetRadii[buildIndex]
+        let totalDistance = max(abs(buildSpotX - buildRollStartX), 1)
+        let traveled = min(abs(walkX - buildRollStartX), totalDistance)
+        let progress = traveled / totalDistance
+        let currentRadius = Self.buildBallStartRadius + (targetRadius - Self.buildBallStartRadius) * progress
+
+        let ballX = walkX + segmentSign * shovelOffset
+        ball.setScale(currentRadius / targetRadius)
+        ball.position = CGPoint(x: ballX, y: accumulator.topY(of: surfaceState, atX: ballX) + currentRadius)
+        ball.zRotation += (segmentSign * currentSpeed * CGFloat(dt)) / max(currentRadius, 1)
+
+        let minX = min(buildLastFeedX, ballX)
+        let maxX = max(buildLastFeedX, ballX)
+        if maxX > minX {
+            accumulator.clearRange(surfaceState, minX: minX, maxX: maxX)
+        }
+        buildLastFeedX = ballX
+
+        if reached {
+            // She's arrived: whether or not the roll sprite hid it, this
+            // prop IS the visible stacked ball from here through the
+            // placing hop and the eventual handoff.
+            ball.alpha = 1
+            ball.setScale(1.0)
+            ball.position = buildStackedPosition(forBallIndex: buildIndex)
+            ball.zRotation = 0
+            beginBuildPlacing()
+        }
+    }
+
+    /// Ball `buildIndex` just reached the build spot. Ball 1 (index 0) just
+    /// stays put as the base — no hop, straight on to the next ball. Ball 2
+    /// (the head) gets a brief lift-and-place arc up onto its stacked spot.
+    private func beginBuildPlacing() {
+        buildPhase = .placing
+        guard let ball = buildBallNode else {
+            finishCurrentBall()
+            return
+        }
+        buildPlacedBalls.append(ball)
+        buildBallNode = nil
+
+        guard buildIndex > 0 else {
+            buildPlaceRemaining = 0
+            finishCurrentBall()
+            return
+        }
+
+        let stackedPosition = buildStackedPosition(forBallIndex: buildIndex)
+        let liftPoint = CGPoint(x: stackedPosition.x, y: stackedPosition.y + 14 * s)
+        let rise = SKAction.move(to: liftPoint, duration: Self.buildPlaceHopDuration * 0.45)
+        rise.timingMode = .easeOut
+        let drop = SKAction.move(to: stackedPosition, duration: Self.buildPlaceHopDuration * 0.55)
+        drop.timingMode = .easeIn
+        ball.run(.sequence([rise, drop]))
+        buildPlaceRemaining = Self.buildPlaceHopDuration
+    }
+
+    /// Just keeps her idling in place while ball `buildIndex`'s hop (if any)
+    /// plays out, then moves on.
+    private func advanceBuildPlacing(dt: TimeInterval) {
+        walkAnim.advance(by: dt)
+        applyFrame(walkAnim.currentTexture)
+        buildPlaceRemaining -= dt
+        if buildPlaceRemaining <= 0 {
+            finishCurrentBall()
+        }
+    }
+
+    /// Advances to the next ball, or — once all 3 are stacked — to the
+    /// real-snowman handoff.
+    private func finishCurrentBall() {
+        buildIndex += 1
+        if buildIndex >= Self.buildBallTargetRadii.count {
+            finishBuildSnowman()
+        } else {
+            beginBuildWalkAway()
+        }
+    }
+
+    /// Where ball `index` rests once stacked, relative to the live surface
+    /// top at `buildSpotX` — mirrors Snowman.assemble's own 2-tier
+    /// (base/head, no torso) stacking math (same 0.3 overlap fraction) so
+    /// the props sit exactly where the real balls will appear, including
+    /// using the same radii (see `buildBallTargetRadii`'s doc comment) —
+    /// the handoff in `finishBuildSnowman()` only reads as seamless if
+    /// nothing jumps.
+    private func buildStackedPosition(forBallIndex index: Int) -> CGPoint {
+        let overlap: CGFloat = 0.3
+        let baseY = accumulator.topY(of: surfaceState, atX: buildSpotX)
+        let r0 = Self.buildBallTargetRadii[0]
+        let r1 = Self.buildBallTargetRadii[1]
+        let baseCenterY = baseY + r0
+        let headCenterY = baseCenterY + r0 * (1 - overlap) + r1 * (1 - overlap)
+        switch index {
+        case 0: return CGPoint(x: buildSpotX, y: baseCenterY)
+        default: return CGPoint(x: buildSpotX, y: headCenterY)
+        }
+    }
+
+    /// Removes any still-in-flight rolling ball and any already-placed-but-
+    /// not-yet-handed-off balls from the scene. `finishBuildSnowman()`
+    /// handles its own (successful) handoff moment directly, so this is
+    /// only exercised by the OTHER ways a build can end: the safety cap, or
+    /// `beginFinish`'s own abort path. A no-op outside `.buildSnowman` mode
+    /// or once nothing is left to clean.
+    private func cleanupBuildProps() {
+        if let ball = buildBallNode {
+            ball.removeFromParent()
+            activeEffects.removeAll { $0 === ball }
+            buildBallNode = nil
+        }
+        for ball in buildPlacedBalls {
+            ball.removeFromParent()
+            activeEffects.removeAll { $0 === ball }
+        }
+        buildPlacedBalls.removeAll()
+    }
+
     private func advanceSweepSegment(dt: TimeInterval) {
         let reached = advanceWalk(dt: dt)
 
@@ -694,18 +1121,14 @@ final class SweeperCharacter {
         }
         lastShovelX = shovelX
 
-        if mode == .buildSnowman {
-            // On a mission: no quirks/rest/stroll — just keep shoveling in
-            // the same direction, back to back, until the fixed stint runs
-            // out, then hand off to assembling the snowman.
-            buildStintRemaining -= dt
-            if buildStintRemaining <= 0 {
-                finishBuildSnowman()
-                return
-            }
-            if reached {
-                beginSweepSegment(direction: currentTravel)
-            }
+        // 분노의 눈덩이 투척: the mound ahead of her shovel is SO maxed out
+        // that pushing it just keeps overflowing back into carriedSnow
+        // instead of fitting anywhere — see rageCarriedSnowThreshold's doc.
+        // Fires at most once per summon (hasRaged latches) and preempts
+        // the rest of this tick (quirks, rollNextActivity) entirely.
+        if !hasRaged, carriedSnow >= Self.rageCarriedSnowThreshold {
+            hasRaged = true
+            beginRage()
             return
         }
 
@@ -744,7 +1167,7 @@ final class SweeperCharacter {
         sweepVisualActive = hasSnow
         if hasSnow {
             let frames = currentTravel == .leftToRight ? sweepLRTextures : sweepRLTextures
-            walkAnim = FrameSequence(frames: frames, timePerFrame: 0.14, loops: true)
+            walkAnim = FrameSequence(frames: frames, timePerFrame: 0.3, loops: true)
         } else {
             walkAnim = FrameSequence(frames: idleTextures, timePerFrame: 0.2, loops: true)
         }
@@ -769,6 +1192,189 @@ final class SweeperCharacter {
         }
     }
 
+    // MARK: - Rage (분노의 눈덩이 투척)
+
+    /// Trigger fired (see `rageCarriedSnowThreshold`): ends her run entirely.
+    /// Stops sweeping, plays the angry sulk once (step 1), then chains
+    /// through pack (`beginRagePack`, step 2) -> wind-up (`beginRageThrow`,
+    /// step 3a) -> throw (`launchRageBall`, step 3b) -> splat
+    /// (`landRageSplat`, steps 4-5). `isWorking = false` mirrors
+    /// `beginFinish`'s shape, but nothing after this re-enters the lazy
+    /// activity loop — the whole rest of the sequence is overlay-driven,
+    /// same mechanism as the hurt/angry reaction.
+    private func beginRage() {
+        isWorking = false
+        playOverlay(sulkTextures, timePerFrame: 0.3) { [weak self] in
+            self?.beginRagePack()
+        }
+    }
+
+    /// Step 2: holds a pack pose while a small prop ball appears at her
+    /// hands and pops up to its packed size.
+    private func beginRagePack() {
+        guard let parent = node.parent else { return }
+        let packedRadius = CGFloat.random(in: Self.rageBallPackedRadiusRange)
+        let ball = SKShapeNode(circleOfRadius: packedRadius)
+        ball.fillColor = .white
+        ball.strokeColor = SKColor(white: 0.85, alpha: 1)
+        ball.lineWidth = 1
+        ball.alpha = 0
+        ball.setScale(0.05)
+        ball.zPosition = node.zPosition + 1
+        ball.position = CGPoint(x: node.position.x + travelSign * 6 * s, y: node.position.y + Self.displayHeight * 0.45)
+        parent.addChild(ball)
+        activeEffects.append(ball)
+        rageBallNode = ball
+
+        let pop = SKAction.sequence([
+            .scale(to: 1.15, duration: Self.ragePackHoldDuration * 0.7),
+            .scale(to: 1.0, duration: Self.ragePackHoldDuration * 0.3)
+        ])
+        ball.run(.group([.fadeIn(withDuration: 0.12), pop]))
+
+        // Packing beat: throw_0 (pressing the snowball, annoyed) then
+        // throw_1 (compacting it, angrier) when the throw sprite set
+        // loaded; older bundles fall back to the placeholder misc-frame
+        // hold, same as before this sheet existed.
+        if let throwTextures {
+            playOverlay([throwTextures[0], throwTextures[1]], timePerFrame: Self.rageThrowFrameHoldDuration) { [weak self] in
+                self?.beginRageThrow()
+            }
+        } else {
+            playOverlay([miscTextures[1]], timePerFrame: Self.ragePackHoldDuration) { [weak self] in
+                self?.beginRageThrow()
+            }
+        }
+    }
+
+    /// Step 3a: wind-up pose (throw_2, over-the-shoulder) before the throw,
+    /// when the throw sprite set loaded; older bundles skip straight to
+    /// `launchRageBall`, same as before this sheet existed.
+    private func beginRageThrow() {
+        guard let throwTextures else {
+            launchRageBall(impactOverlayFrames: [miscTextures[1]])
+            return
+        }
+        playOverlay([throwTextures[2]], timePerFrame: Self.rageWindupHoldDuration) { [weak self] in
+            self?.launchRageBall(impactOverlayFrames: [throwTextures[3]])
+        }
+    }
+
+    /// Step 3b: throws the packed ball at a random point near scene center,
+    /// clamped into the visible bounds, while it scales up dramatically to
+    /// read as flying toward the viewer. `impactOverlayFrames` is the pose
+    /// held for the flight's duration — throw_3 (hurling it at the viewer)
+    /// when the throw sprite set loaded, the placeholder misc-frame
+    /// otherwise (see `beginRageThrow()`).
+    private func launchRageBall(impactOverlayFrames: [SKTexture]) {
+        guard let ball = rageBallNode else { return }
+        let sceneSize = node.scene?.size ?? CGSize(width: 2000, height: 1200)
+        let center = CGPoint(x: sceneSize.width / 2, y: sceneSize.height / 2)
+        let rawTarget = CGPoint(
+            x: center.x + CGFloat.random(in: Self.rageImpactOffsetRange) * (Bool.random() ? 1 : -1),
+            y: center.y + CGFloat.random(in: Self.rageImpactOffsetRange) * (Bool.random() ? 1 : -1)
+        )
+        let inset = Self.rageImpactEdgeInset
+        let impact = CGPoint(
+            x: min(max(rawTarget.x, inset), max(sceneSize.width - inset, inset)),
+            y: min(max(rawTarget.y, inset), max(sceneSize.height - inset, inset))
+        )
+
+        let flightDuration = TimeInterval.random(in: Self.rageThrowDurationRange)
+        let move = SKAction.move(to: impact, duration: flightDuration)
+        move.timingMode = .easeIn
+        let grow = SKAction.scale(to: CGFloat.random(in: Self.rageBallThrowScaleRange), duration: flightDuration)
+        grow.timingMode = .easeIn
+        let spin = SKAction.rotate(byAngle: CGFloat.random(in: -2...2), duration: flightDuration)
+        ball.run(.group([move, grow, spin]))
+
+        playOverlay(impactOverlayFrames, timePerFrame: flightDuration) { [weak self] in
+            self?.landRageSplat(at: impact)
+        }
+    }
+
+    /// Steps 4-5: the ball's arrived — swap it for the splat composition and
+    /// hand the splat off to SnowScene (`onRageSplat`). From this instant
+    /// the splat belongs to the SCENE's effectsLayer/lifecycle, not to this
+    /// instance: it must keep fading for ~10s even after she's gone (her
+    /// `onFinish` fires at the end of the fade kicked off right below), so
+    /// tracking it in `activeEffects` — cleared by both `cancel()` and her
+    /// own natural finish — would drop it the moment either of those runs.
+    /// SnowScene's own cancel-safe array is what `resetAllSnow()` can still
+    /// reach once this instance is deallocated.
+    private func landRageSplat(at point: CGPoint) {
+        guard let parent = node.parent else { return }
+        if let ball = rageBallNode {
+            ball.removeFromParent()
+            activeEffects.removeAll { $0 === ball }
+            rageBallNode = nil
+        }
+
+        let sceneWidth = node.scene?.size.width ?? 2000
+        let splat = Self.makeRageSplatNode(at: point, sceneWidth: sceneWidth)
+        parent.addChild(splat)
+        onRageSplat(splat)
+
+        // 가려졌을 때 fading 되는 시점에 영서도 같이 fading: her own fade starts
+        // in the same instant the splat's fade begins (SnowScene starts
+        // that synchronously inside onRageSplat above) — no wipe/idle tail,
+        // this IS how the run ends.
+        fadeOutAndDespawn(duration: .random(in: Self.rageSelfFadeDurationRange))
+    }
+
+    /// Builds the 분노의 눈덩이 splat: an irregular cluster of overlapping
+    /// white blobs plus a few smaller satellite droplets, sized to roughly
+    /// cover 0.6-0.7x the scene's width, with a couple of slow drip
+    /// extensions for cheap juice. Caller places/owns the returned node —
+    /// see `landRageSplat`.
+    private static func makeRageSplatNode(at point: CGPoint, sceneWidth: CGFloat) -> SKNode {
+        let container = SKNode()
+        container.position = point
+        container.zPosition = 60
+        container.alpha = Self.rageSplatAlpha
+
+        let targetWidth = sceneWidth * CGFloat.random(in: 0.6...0.7)
+        let baseRadius = targetWidth * 0.3
+
+        for _ in 0..<Int.random(in: 5...8) {
+            let radius = baseRadius * CGFloat.random(in: 0.55...1.0)
+            let offset = baseRadius * CGFloat.random(in: 0...0.55)
+            let angle = CGFloat.random(in: 0..<(2 * .pi))
+            let blob = SKShapeNode(circleOfRadius: radius)
+            blob.fillColor = .white
+            blob.strokeColor = .clear
+            blob.position = CGPoint(x: cos(angle) * offset, y: sin(angle) * offset)
+            container.addChild(blob)
+        }
+
+        for _ in 0..<Int.random(in: 3...5) {
+            let radius = baseRadius * CGFloat.random(in: 0.08...0.18)
+            let distance = baseRadius * CGFloat.random(in: 0.9...1.3)
+            let angle = CGFloat.random(in: 0..<(2 * .pi))
+            let droplet = SKShapeNode(circleOfRadius: radius)
+            droplet.fillColor = .white
+            droplet.strokeColor = .clear
+            droplet.position = CGPoint(x: cos(angle) * distance, y: sin(angle) * distance)
+            container.addChild(droplet)
+        }
+
+        for _ in 0..<Int.random(in: 2...3) {
+            let dripWidth = baseRadius * CGFloat.random(in: 0.12...0.2)
+            let dripHeight = baseRadius * CGFloat.random(in: 0.5...0.9)
+            let drip = SKShapeNode(ellipseOf: CGSize(width: dripWidth, height: dripHeight))
+            drip.fillColor = .white
+            drip.strokeColor = .clear
+            let angle = CGFloat.random(in: 0..<(2 * .pi))
+            drip.position = CGPoint(x: cos(angle) * baseRadius * 0.85, y: sin(angle) * baseRadius * 0.85 - dripHeight * 0.3)
+            container.addChild(drip)
+            let slide = SKAction.moveBy(x: 0, y: -CGFloat.random(in: 3...7), duration: 2.0)
+            slide.timingMode = .easeIn
+            drip.run(slide)
+        }
+
+        return container
+    }
+
     // MARK: - Plow interaction
 
     /// Called every frame by SnowScene when the plow is driving the SAME
@@ -777,7 +1383,11 @@ final class SweeperCharacter {
     /// getting plowed while resting or strolling still triggers it, since
     /// this is checked by `update(dt:)` ahead of the activity dispatch.
     func notifyPlowProximity(plowX: CGFloat) {
-        guard !isDone, !isAirborne else { return }
+        // `!hasRaged` also covers "mid-rage": once she's raging, the plow
+        // passing by must never interrupt the pack/throw overlay chain —
+        // it would orphan the in-flight ball the same way beginDrag's
+        // cleanup guards against (see that comment).
+        guard !isDone, !isAirborne, !hasRaged else { return }
         let distance = abs(plowX - currentX)
         if distance > 60 {
             hurtLatched = false
@@ -811,6 +1421,23 @@ final class SweeperCharacter {
     /// She's been grabbed: freeze the routine, startled face, follow the cursor.
     func beginDrag(at p: CGPoint) {
         guard !isDone else { return }
+        if mode == .buildSnowman {
+            // Grabbed mid-build: the illusion can't continue once she's
+            // yanked away mid-roll, so scrap it cleanly right here rather
+            // than leaving half-built prop balls behind or trying to
+            // resume wherever she eventually lands.
+            cleanupBuildProps()
+        }
+        if let ball = rageBallNode {
+            // Grabbed mid-pack/throw: the ball's flight SKAction has no
+            // completion handler of its own (landRageSplat is only reached
+            // via the overlay chain below, which we're about to clear) —
+            // without this cleanup it would keep flying/growing forever
+            // with nothing left to turn it into a splat.
+            ball.removeFromParent()
+            activeEffects.removeAll { $0 === ball }
+            rageBallNode = nil
+        }
         airState = .dragging
         overlay = nil
         onOverlayFinished = nil
@@ -883,9 +1510,22 @@ final class SweeperCharacter {
         if let parent = node.parent {
             spawnPoof(in: parent, at: node.position)
         }
+        isInHurtOrAngry = true
+        if mode == .buildSnowman {
+            // The build was already scrapped the instant she was grabbed
+            // (beginDrag's cleanupBuildProps) — nothing left to build, so
+            // settle straight into the normal wipe/idle finish once she's
+            // done being annoyed about the fall, instead of resuming a
+            // build with no pieces left.
+            isWorking = false
+            playOverlay(sulkTextures, timePerFrame: 0.25) { [weak self] in
+                self?.isInHurtOrAngry = false
+                self?.playFinishWipeIdle()
+            }
+            return
+        }
         beginSweepSegment(direction: currentTravel)
         isWorking = true
-        isInHurtOrAngry = true
         playOverlay(sulkTextures, timePerFrame: 0.25) { [weak self] in
             self?.isInHurtOrAngry = false
         }
@@ -895,7 +1535,9 @@ final class SweeperCharacter {
     /// animation. Repeat clicks while she's already reacting are ignored
     /// (no escalation, she just finishes being annoyed first).
     func poke() {
-        guard !isDone, !isInHurtOrAngry, !isAirborne else { return }
+        // `!hasRaged`: same reasoning as notifyPlowProximity's guard — a
+        // poke mid-rage must not clobber the pack/throw overlay chain.
+        guard !isDone, !isInHurtOrAngry, !isAirborne, !hasRaged else { return }
         isInHurtOrAngry = true
         node.position.x += CGFloat.random(in: -4 * s...4 * s)
         playOverlay(sulkTextures, timePerFrame: 0.25) { [weak self] in
@@ -1130,12 +1772,14 @@ final class SweeperCharacter {
     /// regardless of how much snow is left.
     private func triggerSafetyCapFinish() {
         isWorking = false
+        cleanupBuildProps()
         dumpCarriedSnowAndSpillOverflow()
         playQuirk(.sulk, then: { [weak self] in self?.playFinishWipeIdle() })
     }
 
     private func beginFinish(aborted: Bool) {
         isWorking = false
+        cleanupBuildProps()
         guard !aborted else {
             fadeOutAndDespawn()
             return
@@ -1149,24 +1793,25 @@ final class SweeperCharacter {
         }
     }
 
-    /// `.buildSnowman` mode's wrap-up, reached once the fixed gather stint
-    /// (advanceSweepSegment) runs out. Consumes a chunk of snow near her
-    /// feet — a ~60pt span cleared from the accumulator, plus whatever
-    /// she's carrying — rather than piling/spilling it like the normal
-    /// finish (dumpCarriedSnowAndSpillOverflow): this snow becomes the
-    /// snowman, not a mound. Steps her aside first so the snowman node that
-    /// pops in at her (former) position doesn't appear on top of her, THEN
-    /// hands off via onBuildSnowman, then the proud heart quirk, then the
-    /// normal wipe/idle fade-out tail.
+    /// `.buildSnowman` mode's wrap-up, reached once both balls
+    /// (beginBuildWalkAway/advanceBuildRolling/beginBuildPlacing) are rolled
+    /// and stacked at `buildSpotX`. Steps her aside first so the real
+    /// snowman node about to pop in doesn't appear on top of her, THEN pops
+    /// every prop ball out and fires the handoff IN THE SAME TICK — the
+    /// illusion only reads as seamless if the fake balls vanish the exact
+    /// instant the real ones appear, not a beat before or after — then the
+    /// proud heart quirk, then the normal wipe/idle fade-out tail.
     private func finishBuildSnowman() {
         isWorking = false
+        // Her current position IS the build spot — the last ball's rolling
+        // pass walked her exactly there (segmentTargetX == buildSpotX).
         let buildPoint = node.position
-        if accumulator.states.contains(where: { $0 === surfaceState }) {
-            let half = Self.buildSnowmanClearSpan / 2
-            accumulator.clearRange(surfaceState, minX: currentX - half, maxX: currentX + half)
-        }
-        carriedSnow = 0
         stepAside()
+        for ball in buildPlacedBalls {
+            ball.removeFromParent()
+            activeEffects.removeAll { $0 === ball }
+        }
+        buildPlacedBalls.removeAll()
         onBuildSnowman?(buildPoint)
         playQuirk(.heart, then: { [weak self] in self?.playFinishWipeIdle() })
     }
@@ -1218,9 +1863,9 @@ final class SweeperCharacter {
         }
     }
 
-    private func fadeOutAndDespawn() {
+    private func fadeOutAndDespawn(duration: TimeInterval = 0.4) {
         isDone = true
-        node.run(.sequence([.fadeOut(withDuration: 0.4), .removeFromParent()])) { [weak self] in
+        node.run(.sequence([.fadeOut(withDuration: duration), .removeFromParent()])) { [weak self] in
             self?.onFinish()
         }
     }

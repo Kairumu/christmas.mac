@@ -96,6 +96,11 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             intensityMenuItems[intensity] = item
             intensityMenu.addItem(item)
         }
+        intensityMenu.addItem(.separator())
+        let blizzardItem = NSMenuItem(title: "블리자드", action: #selector(triggerBlizzard), keyEquivalent: "")
+        blizzardItem.target = self
+        intensityMenu.addItem(blizzardItem)
+
         let intensityItem = NSMenuItem(title: "눈 양", action: nil, keyEquivalent: "")
         menu.setSubmenu(intensityMenu, for: intensityItem)
         menu.addItem(intensityItem)
@@ -184,6 +189,10 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
     @objc private func summonSnowplow() {
         overlayManager.summonSnowplow()
+    }
+
+    @objc private func triggerBlizzard() {
+        overlayManager.triggerBlizzard()
     }
 
     @objc private func summonSweeper() {

@@ -1,17 +1,23 @@
+import AppKit
 import SpriteKit
 
 /// Single entry point for the interaction layer. Owns all snowballs/snowmen,
 /// implements `SnowInteractionDelegate` (scoop → roll → stack/throw state
 /// machine), and wires itself as the scene's `interactionDelegate`.
-final class InteractionController: SnowInteractionDelegate {
+/// NSObject only because NSMenuItem target/action requires it (snow menu).
+final class InteractionController: NSObject, SnowInteractionDelegate {
     private enum Draggable {
         case ball(Snowball)
         case snowman(Snowman)
+        /// A 2-ball partial stack, held and moved as one group (its
+        /// container node already positions the balls relative to itself).
+        case stack(PartialStack)
 
         var node: SKNode {
             switch self {
             case .ball(let b): return b
             case .snowman(let s): return s
+            case .stack(let s): return s.container
             }
         }
 
@@ -19,6 +25,7 @@ final class InteractionController: SnowInteractionDelegate {
             switch self {
             case .ball(let b): return b.mass
             case .snowman: return 2500
+            case .stack(let s): return s.balls.reduce(0) { $0 + $1.mass }
             }
         }
     }
@@ -26,6 +33,18 @@ final class InteractionController: SnowInteractionDelegate {
     private enum Phase {
         case idle
         case holding(Draggable)
+        /// Pressed on bare accumulated snow; whether it's a drag (classic
+        /// scoop-and-roll from this point) or a plain click (pops the snow
+        /// action menu) is decided by mouseDragged/mouseUp. Right-click
+        /// proved unreliable through the click-through overlay, so a plain
+        /// left-click is the menu trigger.
+        case pendingSnowPress(CGPoint)
+        /// Pressed on a partial stack; whether it's a drag (group-move,
+        /// see Draggable.stack) or a plain click (pops the "finish as
+        /// 2-tier snowman" menu) is decided the same way as
+        /// `pendingSnowPress`. The entry is already pulled out of
+        /// `partialStacks` so it doesn't double-handle hits while pending.
+        case pendingStackPress(PartialStack, CGPoint)
     }
 
     /// Two balls stacked, waiting for a third to complete a snowman.
@@ -45,17 +64,50 @@ final class InteractionController: SnowInteractionDelegate {
     private var partialStacks: [PartialStack] = []
     private var snowmen: [Snowman] = []
 
+    /// Per-object fall velocity (points/sec downward), keyed by the managed
+    /// node's identity — only ever holds an entry while that object is
+    /// actively falling (its support disappeared); gentle settling and
+    /// at-rest objects have none. See `tick(dt:)`.
+    private var fallVelocities: [ObjectIdentifier: CGFloat] = [:]
+    /// Gravity applied while falling — matches SweeperCharacter.advanceFall's
+    /// own gravity constant so a dropped prop and a dropped 영서 fall at the
+    /// same rate.
+    private static let fallGravity: CGFloat = 900
+    /// How far (points) an object's base may sit above its surface's
+    /// `restingHeight` before it counts as "falling" rather than merely
+    /// riding a pile that's a little uneven underneath it.
+    private static let fallThreshold: CGFloat = 8
+    /// Capped ride speed (points/sec) used to ease an object's base toward
+    /// `restingHeight` when it's within `fallThreshold` of it — keeps a
+    /// growing/shrinking pile from jittering the object up and down.
+    private static let rideSettleSpeed: CGFloat = 30
+    /// Tolerance handed to `restingHeight`'s own belowY check — covers one
+    /// frame of settling/fall motion, same role as SnowScene's
+    /// `landingTolerance`.
+    private static let restingTolerance: CGFloat = 4
+
+    /// The stack a plain click (mouseDown→mouseUp with no drag) just
+    /// lifted out of `partialStacks`, while `presentStackMenu`'s popUp is
+    /// showing its finish-early option. Restored unchanged if the menu is
+    /// dismissed without a selection.
+    private var pendingStackMenuEntry: PartialStack?
+
     private let stackDistance: CGFloat = 70
     private let throwSpeedThreshold: CGFloat = 320
     private let dragGrowthFactor: CGFloat = 0.12
     private let scoopGrowthFactor: CGFloat = 0.35
 
     /// Default ball-size proportions for a snowman assembled whole (not
-    /// from 3 separately player-grown balls) — 영서에게 눈사람 부탁. Decreasing
-    /// base->torso->head, matching an ordinary stacked snowman's look.
+    /// from separately player-grown balls) — 영서에게 눈사람 부탁. 2-tier
+    /// (base + head, no torso): a 3-tier build read as too tall/unsettling
+    /// to the user ("너무 징그러워"), matching the same 2-tier look as the
+    /// player's own "이대로 눈사람 완성" early-finish. Dropping a ball on the
+    /// result still upgrades it to 3-tier afterward, same as any other
+    /// 2-tier snowman (see `upgradeToThreeTier`). Keep in sync with
+    /// SweeperCharacter.buildBallTargetRadii, which mirrors these so the
+    /// real snowman lands at the exact size of the props it replaces.
     private static let builtSnowmanBaseRadius: CGFloat = 30
-    private static let builtSnowmanTorsoRadius: CGFloat = 22
-    private static let builtSnowmanHeadRadius: CGFloat = 15
+    private static let builtSnowmanHeadRadius: CGFloat = 18
 
     /// Key for the per-node action that polls a thrown object's physics body
     /// until it settles, so thrown objects can be re-tracked (see
@@ -66,19 +118,87 @@ final class InteractionController: SnowInteractionDelegate {
     init(scene: SKScene & SnowSceneAPI) {
         self.scene = scene
         self.physics = ThrowPhysics(scene: scene)
+        super.init()
         scene.interactionDelegate = self
         physics.onShatter = { [weak self] node, point in
             self?.handleShatter(node: node, at: point)
         }
     }
 
+    // MARK: - Snow action menu (plain left-click on bare snow)
+
+    private func presentSnowMenu(atScenePoint p: CGPoint) {
+        guard let scene, let view = scene.view else { return }
+        let menu = NSMenu()
+
+        let ballItem = NSMenuItem(title: "여기에 눈덩이 만들기", action: #selector(menuMakeSnowball(_:)), keyEquivalent: "")
+        ballItem.target = self
+        ballItem.representedObject = NSValue(point: p)
+        menu.addItem(ballItem)
+
+        let snowmanItem = NSMenuItem(title: "영서에게 눈사람 부탁", action: #selector(menuAskSnowman(_:)), keyEquivalent: "")
+        snowmanItem.target = self
+        menu.addItem(snowmanItem)
+
+        menu.popUp(positioning: nil, at: scene.convertPoint(toView: p), in: view)
+    }
+
+    @objc private func menuMakeSnowball(_ item: NSMenuItem) {
+        guard let value = item.representedObject as? NSValue else { return }
+        spawnSnowball(atScenePoint: value.pointValue)
+    }
+
+    @objc private func menuAskSnowman(_ item: NSMenuItem) {
+        scene?.summonSweeperForSnowman()
+    }
+
+    // MARK: - Stack action menu (plain left-click on a partial stack)
+
+    /// Plain click (no drag) on a partial stack: offer to finish it early
+    /// as a 2-tier snowman instead of waiting for a 3rd ball. Mirrors
+    /// `presentSnowMenu`'s popup mechanics. `popUp` returns whether an
+    /// item was actually chosen, so dismissing without choosing (click
+    /// elsewhere) puts the stack straight back, unchanged.
+    private func presentStackMenu(for entry: PartialStack, atScenePoint p: CGPoint) {
+        guard let scene, let view = scene.view else {
+            partialStacks.append(entry)
+            return
+        }
+        let menu = NSMenu()
+
+        let finishItem = NSMenuItem(title: "이대로 눈사람 완성", action: #selector(menuFinishTwoTierSnowman(_:)), keyEquivalent: "")
+        finishItem.target = self
+        menu.addItem(finishItem)
+
+        pendingStackMenuEntry = entry
+        let chose = menu.popUp(positioning: nil, at: scene.convertPoint(toView: p), in: view)
+        if !chose, let leftover = pendingStackMenuEntry {
+            partialStacks.append(leftover)
+        }
+        pendingStackMenuEntry = nil
+    }
+
+    @objc private func menuFinishTwoTierSnowman(_ item: NSMenuItem) {
+        guard let entry = pendingStackMenuEntry else { return }
+        pendingStackMenuEntry = nil
+        entry.container.removeFromParent()
+        fallVelocities.removeValue(forKey: ObjectIdentifier(entry.container))
+        let sorted = entry.balls.sorted { $0.radius > $1.radius }
+        spawnSnowman(at: entry.point, baseRadius: sorted[0].radius, torsoRadius: nil, headRadius: sorted[1].radius)
+    }
+
     // MARK: - SnowInteractionDelegate
 
     func mouseDown(atScenePoint p: CGPoint) {
-        guard let scene else { return }
+        guard scene != nil else { return }
 
         if let snowman = snowmanNear(p) {
             snowmen.removeAll { $0 === snowman }
+            // Grabbing a mid-fall object (mouseDown already re-files it as
+            // held, outside the arrays tick(dt:) scans) must drop its fall
+            // state — otherwise a stale velocity would resume as soon as
+            // it's set back down.
+            fallVelocities.removeValue(forKey: ObjectIdentifier(snowman))
             phase = .holding(.snowman(snowman))
             lastDragPoint = p
             GloveCursor.push()
@@ -87,6 +207,7 @@ final class InteractionController: SnowInteractionDelegate {
 
         if let ball = ballNear(p) {
             snowballs.removeAll { $0 === ball }
+            fallVelocities.removeValue(forKey: ObjectIdentifier(ball))
             phase = .holding(.ball(ball))
             lastDragPoint = p
             GloveCursor.push()
@@ -94,56 +215,57 @@ final class InteractionController: SnowInteractionDelegate {
         }
 
         // A partial stack (2 balls, waiting for a 3rd to become a snowman)
-        // claims a 70pt interactive radius via `isInteractive`, but had no
-        // pickup branch here — clicks fell through to scoopSnow (0 in
-        // mid-air) and did nothing, so the overlay captured clicks in that
-        // whole radius with no way to act on them. Picking up the topmost
-        // ball disassembles the stack; the remainder goes back to being a
-        // loose, re-stackable ball.
+        // claims a 70pt interactive radius via `isInteractive`. Whether
+        // this press becomes a group-drag (the balls stay stacked, moving
+        // as one unit — see Draggable.stack) or a plain click (pops the
+        // "finish early" menu) is decided by mouseDragged/mouseUp, same
+        // as the pendingSnowPress click-vs-drag split below.
         if let idx = partialStackNear(p) {
-            let entry = partialStacks[idx]
-            let sorted = entry.balls.sorted { $0.radius > $1.radius }
-            guard let top = sorted.last else { return }
-            let remaining = sorted.dropLast()
-
-            entry.container.removeFromParent()
-            partialStacks.remove(at: idx)
-
-            for ball in remaining {
-                ball.removeAllActions()
-                ball.removeFromParent()
-                ball.setScale(1.0)
-                ball.alpha = 1
-                ball.position = entry.point
-                scene.addChild(ball)
-                snowballs.append(ball)
-            }
-
-            top.removeAllActions()
-            top.removeFromParent()
-            top.setScale(1.0)
-            top.alpha = 1
-            top.position = p
-            scene.addChild(top)
-            phase = .holding(.ball(top))
+            let entry = partialStacks.remove(at: idx)
+            fallVelocities.removeValue(forKey: ObjectIdentifier(entry.container))
+            phase = .pendingStackPress(entry, p)
             lastDragPoint = p
-            GloveCursor.push()
             return
         }
 
-        let scooped = scene.scoopSnow(atScenePoint: p)
-        guard scooped > 0 else { return }
-
-        let ball = Snowball(radius: Snowball.minRadius)
-        ball.position = p
-        ball.grow(by: scooped * scoopGrowthFactor)
-        scene.addChild(ball)
-        phase = .holding(.ball(ball))
+        // Bare accumulated snow: don't scoop yet — a drag past the small
+        // threshold becomes the classic scoop-and-roll (see mouseDragged),
+        // while a plain click pops the snow action menu (see mouseUp).
+        phase = .pendingSnowPress(p)
         lastDragPoint = p
-        GloveCursor.push()
     }
 
     func mouseDragged(toScenePoint p: CGPoint, velocity: CGVector) {
+        // A pending snow press turns into the classic scoop-and-roll once
+        // the cursor has clearly moved (same 5pt threshold 영서's own
+        // click-vs-drag decision uses).
+        if case .pendingSnowPress(let origin) = phase, let scene {
+            guard hypot(p.x - origin.x, p.y - origin.y) > 5 else { return }
+            let scooped = scene.scoopSnow(atScenePoint: origin)
+            guard scooped > 0 else {
+                phase = .idle
+                return
+            }
+            let ball = Snowball(radius: Snowball.minRadius)
+            ball.position = origin
+            ball.grow(by: scooped * scoopGrowthFactor)
+            scene.addChild(ball)
+            phase = .holding(.ball(ball))
+            lastDragPoint = origin
+            GloveCursor.push()
+            // fall through — the fresh .holding phase handles THIS drag too
+        }
+
+        // Same click-vs-drag split as above, for a pending partial-stack
+        // press: past the threshold, it's a group-drag of the whole stack.
+        if case .pendingStackPress(let entry, let origin) = phase {
+            guard hypot(p.x - origin.x, p.y - origin.y) > 5 else { return }
+            phase = .holding(.stack(entry))
+            lastDragPoint = origin
+            GloveCursor.push()
+            // fall through — the fresh .holding phase handles THIS drag too
+        }
+
         guard case .holding(let draggable) = phase, let scene else { return }
 
         if case .ball(let ball) = draggable, let last = lastDragPoint {
@@ -160,6 +282,16 @@ final class InteractionController: SnowInteractionDelegate {
     }
 
     func mouseUp(atScenePoint p: CGPoint, velocity: CGVector) {
+        if case .pendingSnowPress(let origin) = phase {
+            phase = .idle
+            presentSnowMenu(atScenePoint: origin)
+            return
+        }
+        if case .pendingStackPress(let entry, let origin) = phase {
+            phase = .idle
+            presentStackMenu(for: entry, atScenePoint: origin)
+            return
+        }
         guard case .holding(let draggable) = phase else { return }
         phase = .idle
         lastDragPoint = nil
@@ -182,6 +314,12 @@ final class InteractionController: SnowInteractionDelegate {
             } else {
                 snowballs.append(ball)
             }
+        case .stack(var entry):
+            // Set down at its current (possibly moved) position; a loose
+            // ball dropped near here still completes the snowman via
+            // stackTarget(near:)'s partialStacks lookup against this point.
+            entry.point = p
+            partialStacks.append(entry)
         }
     }
 
@@ -207,14 +345,121 @@ final class InteractionController: SnowInteractionDelegate {
         snowballs.append(ball)
     }
 
-    /// 영서가 눈사람을 만들어주는 메뉴: assemble a complete snowman directly at p,
-    /// via the same shared helper the 3rd-ball stack completion uses.
+    /// 영서가 눈사람을 만들어주는 메뉴: assemble a complete 2-tier snowman
+    /// directly at p, via the same shared helper the 3rd-ball stack
+    /// completion uses.
     func buildSnowman(atScenePoint p: CGPoint) {
-        spawnSnowman(at: p, baseRadius: Self.builtSnowmanBaseRadius, torsoRadius: Self.builtSnowmanTorsoRadius, headRadius: Self.builtSnowmanHeadRadius)
+        spawnSnowman(at: p, baseRadius: Self.builtSnowmanBaseRadius, torsoRadius: nil, headRadius: Self.builtSnowmanHeadRadius)
     }
 
     func isInteractive(atScenePoint p: CGPoint) -> Bool {
         ballNear(p) != nil || snowmanNear(p) != nil || partialStackNear(p) != nil
+    }
+
+    // MARK: - Falling / resting (per-frame tick)
+
+    /// Called every frame from SnowScene.update, after the sweeper block.
+    /// Every managed object NOT currently held (mouseDown already pulled a
+    /// held object out of these arrays) and not mid-throw (a non-nil
+    /// physicsBody means ThrowPhysics still owns its position) gets
+    /// checked against the live surface below it: drop with gravity if its
+    /// support just disappeared, or gently ride a pile that's grown/shrunk
+    /// under it — mirroring 영서's own live pin-to-surface-top behavior
+    /// (SweeperCharacter.update) for loose props instead of a character.
+    func tick(dt: TimeInterval) {
+        guard let scene else { return }
+
+        for ball in snowballs {
+            settle(node: ball, baseYOffset: ball.radius, dt: dt, scene: scene)
+        }
+        for snowman in snowmen {
+            // Snowman.position IS its base (bottom-center anchor), so
+            // there's no offset to subtract.
+            settle(node: snowman, baseYOffset: 0, dt: dt, scene: scene)
+        }
+        for i in partialStacks.indices {
+            // The container's position is itself the stack's base point
+            // (see makePartialStackVisual) — keep `point` in sync whenever
+            // settle(...) actually moves it, same as mouseUp's set-down.
+            if let newBaseY = settle(node: partialStacks[i].container, baseYOffset: 0, dt: dt, scene: scene) {
+                partialStacks[i].point.y = newBaseY
+            }
+        }
+    }
+
+    /// Applies gravity-fall or gentle ride-the-pile settling to one managed
+    /// node. `baseYOffset` converts the node's own (possibly center-
+    /// anchored) position into its bottom-anchored base y. Returns the
+    /// object's new base y whenever it moved this tick, so callers that
+    /// track a base point separately (PartialStack) can stay in sync.
+    @discardableResult
+    private func settle(node: SKNode, baseYOffset: CGFloat, dt: TimeInterval, scene: SKScene & SnowSceneAPI) -> CGFloat? {
+        // ThrowPhysics owns this node's position until it settles and is
+        // re-tracked (see watchForSettle/retrack) — never fight it, and
+        // drop any stale fall state so it doesn't resume once it's done.
+        guard node.physicsBody == nil else {
+            fallVelocities.removeValue(forKey: ObjectIdentifier(node))
+            return nil
+        }
+
+        let baseX = node.position.x
+        let baseY = node.position.y - baseYOffset
+        let desired = scene.restingHeight(atX: baseX, belowY: baseY + Self.restingTolerance)
+        let key = ObjectIdentifier(node)
+
+        if baseY > desired + Self.fallThreshold {
+            var vy = fallVelocities[key] ?? 0
+            vy -= Self.fallGravity * CGFloat(dt)
+            var newBaseY = baseY + vy * CGFloat(dt)
+            if newBaseY <= desired {
+                newBaseY = desired
+                fallVelocities.removeValue(forKey: key)
+                playLandingBounce(node, at: CGPoint(x: baseX, y: newBaseY + baseYOffset))
+            } else {
+                fallVelocities[key] = vy
+            }
+            node.position.y = newBaseY + baseYOffset
+            return newBaseY
+        }
+
+        // Not (or no longer) falling — any leftover velocity from a moment
+        // ago is stale.
+        fallVelocities.removeValue(forKey: key)
+
+        guard abs(baseY - desired) <= Self.fallThreshold, desired != baseY else { return nil }
+        let maxStep = Self.rideSettleSpeed * CGFloat(dt)
+        let newBaseY = baseY + max(-maxStep, min(maxStep, desired - baseY))
+        node.position.y = newBaseY + baseYOffset
+        return newBaseY
+    }
+
+    /// Landing juice for a fall that just touched down: a quick squash-
+    /// and-recover (scaleY 0.92 -> 1.0) plus a couple of small snow puffs,
+    /// reusing ThrowPhysics.spawnShatter's puff-circle look at a smaller,
+    /// cheaper scale.
+    private func playLandingBounce(_ node: SKNode, at point: CGPoint) {
+        node.yScale = 0.92
+        let recover = SKAction.scaleY(to: 1.0, duration: 0.15)
+        recover.timingMode = .easeOut
+        node.run(recover)
+        spawnLandingPuff(at: point)
+    }
+
+    private func spawnLandingPuff(at point: CGPoint) {
+        guard let scene else { return }
+        for _ in 0..<2 {
+            let circle = SKShapeNode(circleOfRadius: 5)
+            circle.fillColor = .white
+            circle.strokeColor = .clear
+            circle.alpha = 0.7
+            circle.position = CGPoint(x: point.x + CGFloat.random(in: -6...6), y: point.y)
+            circle.zPosition = 150
+            scene.addChild(circle)
+            circle.run(.sequence([
+                .group([.scale(to: CGFloat.random(in: 1.8...2.4), duration: 0.3), .fadeOut(withDuration: 0.3)]),
+                .removeFromParent()
+            ]))
+        }
     }
 
     func resetAll() {
@@ -227,6 +472,15 @@ final class InteractionController: SnowInteractionDelegate {
         // idle, all in the same call.
         if case .holding(let draggable) = phase {
             draggable.node.removeFromParent()
+        } else if case .pendingStackPress(let entry, _) = phase {
+            entry.container.removeFromParent()
+        }
+        if let pending = pendingStackMenuEntry {
+            // A stack menu may be open (popUp runs its own nested run
+            // loop); clearing this before it returns stops it from
+            // resurrecting an already-reset stack.
+            pending.container.removeFromParent()
+            pendingStackMenuEntry = nil
         }
         snowballs.forEach { $0.removeFromParent() }
         snowmen.forEach { $0.removeFromParent() }
@@ -234,6 +488,7 @@ final class InteractionController: SnowInteractionDelegate {
         snowballs.removeAll()
         snowmen.removeAll()
         partialStacks.removeAll()
+        fallVelocities.removeAll()
         phase = .idle
         lastDragPoint = nil
         GloveCursor.pop()
@@ -258,11 +513,17 @@ final class InteractionController: SnowInteractionDelegate {
     private enum StackTarget {
         case lone(Snowball)
         case partial(Int)
+        /// An already-completed 2-tier snowman: 3개 붙이면 3단으로 되게 — a
+        /// 2-tier snowman is never a dead end, a dropped ball upgrades it.
+        case twoTierSnowman(Snowman)
     }
 
     private func stackTarget(near p: CGPoint, excluding ball: Snowball) -> StackTarget? {
         if let idx = partialStacks.firstIndex(where: { hypot($0.point.x - p.x, $0.point.y - p.y) < stackDistance }) {
             return .partial(idx)
+        }
+        if let snowman = snowmen.first(where: { $0.isTwoTier && hypot($0.position.x - p.x, $0.position.y - p.y) < stackDistance }) {
+            return .twoTierSnowman(snowman)
         }
         if let lone = snowballs.first(where: { $0 !== ball && hypot($0.position.x - p.x, $0.position.y - p.y) < stackDistance }) {
             return .lone(lone)
@@ -277,6 +538,8 @@ final class InteractionController: SnowInteractionDelegate {
             let point = other.position
             other.removeFromParent()
             ball.removeFromParent()
+            fallVelocities.removeValue(forKey: ObjectIdentifier(other))
+            fallVelocities.removeValue(forKey: ObjectIdentifier(ball))
 
             let container = makePartialStackVisual(balls: [other, ball], at: point)
             scene?.addChild(container)
@@ -288,22 +551,68 @@ final class InteractionController: SnowInteractionDelegate {
             ball.removeFromParent()
             entry.container.removeFromParent()
             partialStacks.remove(at: idx)
+            fallVelocities.removeValue(forKey: ObjectIdentifier(entry.container))
+            fallVelocities.removeValue(forKey: ObjectIdentifier(ball))
 
             let sorted = entry.balls.sorted { $0.radius > $1.radius }
             spawnSnowman(at: entry.point, baseRadius: sorted[0].radius, torsoRadius: sorted[1].radius, headRadius: sorted[2].radius)
+
+        case .twoTierSnowman(let snowman):
+            upgradeToThreeTier(snowman, addingTorsoFrom: ball)
         }
+    }
+
+    /// A loose ball dropped near an already-finished 2-tier snowman
+    /// upgrades it to 3-tier: the new ball becomes the torso. Rebuilding
+    /// from scratch at the same point/variant is the simplest correct way
+    /// to "insert" a torso mid-structure — Snowman's own assemble() already
+    /// does the staged pop-in, so the torso (and the rest of the parts)
+    /// pop in again as if the snowman were growing.
+    private func upgradeToThreeTier(_ snowman: Snowman, addingTorsoFrom ball: Snowball) {
+        let point = snowman.position
+        // Only a classic 2-tier snowman ever reaches here (`isTwoTier` is
+        // always false for a pixel-sculpture kind — see Snowman.isTwoTier),
+        // but `kind`/`colorway` are still threaded through explicitly
+        // rather than left to spawnSnowman's random defaults, so this stays
+        // correct even if that ever changes: the upgrade keeps the exact
+        // look it already had instead of re-rolling a fresh one.
+        let kind = snowman.kind
+        let colorway = snowman.colorway
+        let variant = snowman.variant
+        let baseRadius = snowman.baseRadius
+        let headRadius = snowman.headRadius
+        let torsoRadius = ball.radius
+
+        ball.removeFromParent()
+        snowmen.removeAll { $0 === snowman }
+        snowman.removeFromParent()
+        fallVelocities.removeValue(forKey: ObjectIdentifier(snowman))
+        fallVelocities.removeValue(forKey: ObjectIdentifier(ball))
+
+        spawnSnowman(at: point, kind: kind, colorway: colorway, variant: variant, baseRadius: baseRadius, torsoRadius: torsoRadius, headRadius: headRadius)
     }
 
     /// Shared snowman-assembly entry point: constructs a Snowman (which
     /// itself runs the staged parts-appear-one-by-one pop-in) and registers
     /// it in `snowmen` so it's clickable/throwable/resettable like any
-    /// other. Used both by the 3rd-ball stack completion above and by
-    /// buildSnowman(atScenePoint:) (영서에게 눈사람 부탁), so the two paths never
-    /// duplicate the assembly/registration logic.
-    private func spawnSnowman(at point: CGPoint, baseRadius: CGFloat, torsoRadius: CGFloat, headRadius: CGFloat) {
+    /// other. Used by the 3rd-ball stack completion, buildSnowman(atScenePoint:)
+    /// (영서에게 눈사람 부탁), the 2-tier "finish early" menu (`torsoRadius: nil`),
+    /// and the 2-tier→3-tier upgrade (explicit `kind`/`colorway`/`variant`,
+    /// to keep the look the same instead of rolling a fresh one) — so none
+    /// of those paths duplicate the assembly/registration logic.
+    ///
+    /// `kind`/`variant` default to a fresh roll each call (every completion
+    /// path except the upgrade wants that) — `kind` picks one of the 10
+    /// looks (feature: pixel-art snowman kinds; see SnowmanKind.random's
+    /// weighting), `colorway` picks this spawn's pastel tint for whichever
+    /// pixel-sculpture kind came up (a `.classic` roll ignores it and uses
+    /// `variant` instead).
+    private func spawnSnowman(at point: CGPoint, kind: SnowmanKind = SnowmanKind.random(), colorway: SnowmanColorway = SnowmanColorway.random(), variant: SnowmanVariant = SnowmanVariant.next(), baseRadius: CGFloat, torsoRadius: CGFloat?, headRadius: CGFloat) {
         let snowman = Snowman(
             basePoint: point,
-            variant: SnowmanVariant.next(),
+            kind: kind,
+            colorway: colorway,
+            variant: variant,
             baseRadius: baseRadius,
             torsoRadius: torsoRadius,
             headRadius: headRadius
@@ -372,6 +681,14 @@ final class InteractionController: SnowInteractionDelegate {
         case .snowman(let snowman):
             guard !snowmen.contains(where: { $0 === snowman }) else { return }
             snowmen.append(snowman)
+        case .stack(var entry):
+            // A thrown stack that lands (bounces, doesn't shatter) becomes
+            // a partial stack again at its rest position — cleaner than
+            // unpacking it into two loose balls, since the container
+            // already holds them correctly positioned relative to itself.
+            guard !partialStacks.contains(where: { $0.container === entry.container }) else { return }
+            entry.point = entry.container.position
+            partialStacks.append(entry)
         }
     }
 
