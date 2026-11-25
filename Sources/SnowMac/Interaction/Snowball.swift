@@ -4,7 +4,7 @@ import SpriteKit
 /// gray texture dots. `radius` drives both the visual size and `mass`.
 final class Snowball: SKNode {
     static let minRadius: CGFloat = 7
-    static let maxRadius: CGFloat = 46
+    static let maxRadius: CGFloat = 34
 
     private(set) var radius: CGFloat
     private let body = SKShapeNode()

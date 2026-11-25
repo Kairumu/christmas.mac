@@ -4,3 +4,4 @@ build/
 .DS_Store
 .swiftpm/
 _resource/.openai_key
+SnowMac.zip

@@ -52,6 +52,20 @@ final class InteractionController: NSObject, SnowInteractionDelegate {
         var point: CGPoint
         var balls: [Snowball]
         let container: SKNode
+        /// Vertical reach of this stack's visual above `point` (`point`'s y
+        /// to the top of the upper ball), computed at creation time (see
+        /// `makePartialStackVisual`). A flat point-distance check against
+        /// `point` alone undershoots a tall stack of two large balls —
+        /// dropping a 3rd ball squarely ON TOP of the stack (the natural
+        /// place to complete it) can land well over `stackDistance` away
+        /// from the base point and silently fail to match. Hit testing
+        /// (`partialStackNear`, `stackTarget`'s `.partial` case) instead
+        /// treats the stack as a vertical capsule — `stackDistance` of
+        /// slack anywhere along this height, via `verticalDistance(from:
+        /// base:height:)` — so a drop anywhere over the stack's actual
+        /// footprint registers, while a drop clearly off to the side still
+        /// doesn't (horizontal slack stays exactly `stackDistance`).
+        let height: CGFloat
     }
 
     private weak var scene: (SKScene & SnowSceneAPI)?
@@ -108,6 +122,19 @@ final class InteractionController: NSObject, SnowInteractionDelegate {
     /// real snowman lands at the exact size of the props it replaces.
     private static let builtSnowmanBaseRadius: CGFloat = 30
     private static let builtSnowmanHeadRadius: CGFloat = 18
+
+    /// Upper bounds for ball-stack radii once they become snowman tiers.
+    /// Snowball.maxRadius lets a player-grown ball get much bigger than a
+    /// classic snowman tier should ever be; without clamping here, a
+    /// stack of maxed balls (or a maxed ball dropped as a torso) produces
+    /// an oversized, badly-proportioned snowman instead of the intended
+    /// cute/compact look — the 3rd-ball stack completion
+    /// (`stack(_:onto:)`'s `.partial` case), the 2-ball early finish
+    /// (`menuFinishTwoTierSnowman`), and the 2-tier→3-tier torso upgrade
+    /// (`upgradeToThreeTier`) all clamp through these.
+    private static let maxTierBaseRadius: CGFloat = 34
+    private static let maxTierTorsoRadius: CGFloat = 26
+    private static let maxTierHeadRadius: CGFloat = 22
 
     /// Key for the per-node action that polls a thrown object's physics body
     /// until it settles, so thrown objects can be re-tracked (see
@@ -184,7 +211,12 @@ final class InteractionController: NSObject, SnowInteractionDelegate {
         entry.container.removeFromParent()
         fallVelocities.removeValue(forKey: ObjectIdentifier(entry.container))
         let sorted = entry.balls.sorted { $0.radius > $1.radius }
-        spawnSnowman(at: entry.point, baseRadius: sorted[0].radius, torsoRadius: nil, headRadius: sorted[1].radius)
+        spawnSnowman(
+            at: entry.point,
+            baseRadius: min(sorted[0].radius, Self.maxTierBaseRadius),
+            torsoRadius: nil,
+            headRadius: min(sorted[1].radius, Self.maxTierHeadRadius)
+        )
     }
 
     // MARK: - SnowInteractionDelegate
@@ -369,8 +401,28 @@ final class InteractionController: NSObject, SnowInteractionDelegate {
     func tick(dt: TimeInterval) {
         guard let scene else { return }
 
+        // Balls that finish a gravity fall THIS tick get a stacking
+        // re-check at their landing spot. Stacking used to be evaluated
+        // only at the mouseUp instant — once the fall/settle system
+        // landed a dropped ball ON another ball/stack afterwards, nothing
+        // ever re-evaluated, so balls released from a height just ended
+        // up overlapping unmerged ("직접 만들면 안 만들어지는데").
+        var landedBalls: [Snowball] = []
         for ball in snowballs {
+            let wasFalling = fallVelocities[ObjectIdentifier(ball)] != nil
             settle(node: ball, baseYOffset: ball.radius, dt: dt, scene: scene)
+            if wasFalling,
+               fallVelocities[ObjectIdentifier(ball)] == nil,
+               ball.physicsBody == nil {
+                landedBalls.append(ball)
+            }
+        }
+        for ball in landedBalls {
+            // stack() mutates the arrays — only merge balls still loose.
+            guard snowballs.contains(where: { $0 === ball }) else { continue }
+            if let target = stackTarget(near: ball.position, excluding: ball) {
+                stack(ball, onto: target)
+            }
         }
         for snowman in snowmen {
             // Snowman.position IS its base (bottom-center anchor), so
@@ -504,8 +556,18 @@ final class InteractionController: NSObject, SnowInteractionDelegate {
         snowmen.first { $0.contains(scenePoint: p) }
     }
 
+    /// Distance from `p` to the nearest point on the vertical segment
+    /// running from `base` up to `base.y + height` at `base.x` — i.e.
+    /// treats a tall stack/snowman as a line with `stackDistance` of
+    /// slack all along its height, rather than a single anchor point.
+    /// Reduces to the plain point-distance `hypot` when `height == 0`.
+    private func verticalDistance(from p: CGPoint, base: CGPoint, height: CGFloat) -> CGFloat {
+        let clampedY = min(max(p.y, base.y), base.y + height)
+        return hypot(p.x - base.x, p.y - clampedY)
+    }
+
     private func partialStackNear(_ p: CGPoint) -> Int? {
-        partialStacks.firstIndex { hypot($0.point.x - p.x, $0.point.y - p.y) <= stackDistance }
+        partialStacks.firstIndex { verticalDistance(from: p, base: $0.point, height: $0.height) <= stackDistance }
     }
 
     // MARK: - Stacking
@@ -518,14 +580,35 @@ final class InteractionController: NSObject, SnowInteractionDelegate {
         case twoTierSnowman(Snowman)
     }
 
+    /// Priority when more than one target is in range at once: a 2-tier
+    /// snowman upgrade ranks highest, then completing an existing partial
+    /// stack into a full snowman, then (lowest) pairing with another lone
+    /// ball — finishing something already in progress always beats
+    /// starting a brand-new pair.
+    ///
+    /// Each branch tests against the target's actual occupied region, not
+    /// just its anchor point — `position`/`point` is always the BASE, so a
+    /// flat `stackDistance` from there undershoots anything built from
+    /// large balls (dropping squarely on top of a tall stack, or on a big
+    /// snowman's head, used to miss both targets entirely and silently
+    /// fall through to pairing with some other lone ball instead).
     private func stackTarget(near p: CGPoint, excluding ball: Snowball) -> StackTarget? {
-        if let idx = partialStacks.firstIndex(where: { hypot($0.point.x - p.x, $0.point.y - p.y) < stackDistance }) {
-            return .partial(idx)
-        }
-        if let snowman = snowmen.first(where: { $0.isTwoTier && hypot($0.position.x - p.x, $0.position.y - p.y) < stackDistance }) {
+        // A snowman's `hitRadius` already approximates how far from its
+        // base point its own body/head reaches (it's the same radius
+        // `contains(scenePoint:)` uses for ordinary clicks) — using it
+        // here instead of the flat `stackDistance` keeps this consistent
+        // with how clicking the snowman already behaves.
+        if let snowman = snowmen.first(where: { $0.isTwoTier && hypot($0.position.x - p.x, $0.position.y - p.y) < $0.hitRadius }) {
             return .twoTierSnowman(snowman)
         }
-        if let lone = snowballs.first(where: { $0 !== ball && hypot($0.position.x - p.x, $0.position.y - p.y) < stackDistance }) {
+        if let idx = partialStacks.firstIndex(where: { verticalDistance(from: p, base: $0.point, height: $0.height) < stackDistance }) {
+            return .partial(idx)
+        }
+        // Lone balls are just circles, so their "occupied region" is the
+        // ball itself — widen the flat `stackDistance` slack by both
+        // balls' radii so two big balls pair as soon as they're actually
+        // touching, not just within the same flat distance tiny balls use.
+        if let lone = snowballs.first(where: { $0 !== ball && hypot($0.position.x - p.x, $0.position.y - p.y) < stackDistance + ball.radius + $0.radius }) {
             return .lone(lone)
         }
         return nil
@@ -541,9 +624,9 @@ final class InteractionController: NSObject, SnowInteractionDelegate {
             fallVelocities.removeValue(forKey: ObjectIdentifier(other))
             fallVelocities.removeValue(forKey: ObjectIdentifier(ball))
 
-            let container = makePartialStackVisual(balls: [other, ball], at: point)
+            let (container, reach) = makePartialStackVisual(balls: [other, ball], at: point)
             scene?.addChild(container)
-            partialStacks.append(PartialStack(point: point, balls: [other, ball], container: container))
+            partialStacks.append(PartialStack(point: point, balls: [other, ball], container: container, height: reach))
 
         case .partial(let idx):
             var entry = partialStacks[idx]
@@ -555,7 +638,12 @@ final class InteractionController: NSObject, SnowInteractionDelegate {
             fallVelocities.removeValue(forKey: ObjectIdentifier(ball))
 
             let sorted = entry.balls.sorted { $0.radius > $1.radius }
-            spawnSnowman(at: entry.point, baseRadius: sorted[0].radius, torsoRadius: sorted[1].radius, headRadius: sorted[2].radius)
+            spawnSnowman(
+                at: entry.point,
+                baseRadius: min(sorted[0].radius, Self.maxTierBaseRadius),
+                torsoRadius: min(sorted[1].radius, Self.maxTierTorsoRadius),
+                headRadius: min(sorted[2].radius, Self.maxTierHeadRadius)
+            )
 
         case .twoTierSnowman(let snowman):
             upgradeToThreeTier(snowman, addingTorsoFrom: ball)
@@ -581,7 +669,7 @@ final class InteractionController: NSObject, SnowInteractionDelegate {
         let variant = snowman.variant
         let baseRadius = snowman.baseRadius
         let headRadius = snowman.headRadius
-        let torsoRadius = ball.radius
+        let torsoRadius = min(ball.radius, Self.maxTierTorsoRadius)
 
         ball.removeFromParent()
         snowmen.removeAll { $0 === snowman }
@@ -621,22 +709,44 @@ final class InteractionController: NSObject, SnowInteractionDelegate {
         snowmen.append(snowman)
     }
 
-    private func makePartialStackVisual(balls: [Snowball], at point: CGPoint) -> SKNode {
+    /// Arranges two balls as a strict vertical stack inside a fresh
+    /// container positioned at `point` — bigger ball always on the bottom
+    /// (ties keep their given order, since `sorted` is stable), smaller on
+    /// top, both centered on the same x, with the same 0.3 overlap
+    /// fraction `Snowman.assemble`'s tiers use. Previously each ball's
+    /// offset was computed independently via an incrementing accumulator
+    /// sized off that ball's OWN radius only, which (for two near-equal/
+    /// maxed balls) under-separated the pair into a visually overlapping
+    /// blob instead of a clean stack; this computes both centers from the
+    /// pair together so the result is consistent regardless of how close
+    /// the two radii are.
+    ///
+    /// Also returns the vertical reach of the resulting visual (`point`'s
+    /// y to the top of the upper ball), so the caller can size the
+    /// stack's hit-test radius to actually cover it — a flat
+    /// `stackDistance` undershoots a tall stack of two large balls.
+    private func makePartialStackVisual(balls: [Snowball], at point: CGPoint) -> (container: SKNode, reach: CGFloat) {
         let container = SKNode()
         container.position = point
         container.name = "snowman-partial"
 
+        let overlap: CGFloat = 0.3
         let sorted = balls.sorted { $0.radius > $1.radius }
-        var y: CGFloat = 0
-        for ball in sorted {
-            ball.position = CGPoint(x: 0, y: y + ball.radius * 0.85)
+        let bottom = sorted[0]
+        let top = sorted[1]
+
+        let bottomCenterY = bottom.radius * 0.85
+        let topCenterY = bottomCenterY + (bottom.radius + top.radius) * (1 - overlap)
+
+        for (ball, centerY) in [(bottom, bottomCenterY), (top, topCenterY)] {
+            ball.position = CGPoint(x: 0, y: centerY)
             ball.setScale(0.01)
             ball.alpha = 0
             container.addChild(ball)
             ball.run(.group([.fadeIn(withDuration: 0.12), .scale(to: 1.0, duration: 0.12)]))
-            y += ball.radius * 1.5
         }
-        return container
+
+        return (container, topCenterY + top.radius)
     }
 
     // MARK: - Throwing / shattering
