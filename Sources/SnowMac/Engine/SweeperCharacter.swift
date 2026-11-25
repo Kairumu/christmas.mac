@@ -995,7 +995,11 @@ final class SweeperCharacter {
         let minX = min(buildLastFeedX, ballX)
         let maxX = max(buildLastFeedX, ballX)
         if maxX > minX {
-            accumulator.clearRange(surfaceState, minX: minX, maxX: maxX)
+            // Take only PART of each column she rolls over — fully zeroing
+            // the path (old clearRange) stripped a single-surface screen
+            // bare, which read as "부탁하면 눈이 다 사라진다" on machines where
+            // screenBottom is the only snowy surface.
+            accumulator.consumeRange(surfaceState, minX: minX, maxX: maxX, fraction: 0.45)
         }
         buildLastFeedX = ballX
 
@@ -1803,6 +1807,9 @@ final class SweeperCharacter {
     /// proud heart quirk, then the normal wipe/idle fade-out tail.
     private func finishBuildSnowman() {
         isWorking = false
+        if ProcessInfo.processInfo.environment["SNOWMAC_DEBUG"] != nil {
+            FileHandle.standardError.write("SNOWMAC_DEBUG snowman: finishBuildSnowman buildSpotX=\(String(format: "%.1f", buildSpotX)) surfaceSpan=[\(String(format: "%.1f", surfaceMinX)), \(String(format: "%.1f", surfaceMaxX))] placedBalls=\(buildPlacedBalls.count)\n".data(using: .utf8)!)
+        }
         // Her current position IS the build spot — the last ball's rolling
         // pass walked her exactly there (segmentTargetX == buildSpotX).
         let buildPoint = node.position

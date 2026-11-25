@@ -386,6 +386,27 @@ final class SnowAccumulator {
     }
 
     /// Zero out columns in `state` whose x range overlaps [minX, maxX].
+    /// Partially consumes a span: removes `fraction` of each column's height
+    /// and returns the total mass taken. Used by 영서's build-mode rolling
+    /// pass instead of `clearRange` — fully zeroing her path stripped a
+    /// single-surface screen bare ("영서에게 눈사람 부탁하면 눈이 다 사라진다"),
+    /// while taking a fraction leaves a visible snow trail behind her.
+    @discardableResult
+    func consumeRange(_ state: SurfaceState, minX: CGFloat, maxX: CGFloat, fraction: CGFloat) -> CGFloat {
+        let startIdx = max(Int((minX - state.surface.minX) / Self.columnWidth), 0)
+        let endIdx = min(Int((maxX - state.surface.minX) / Self.columnWidth), state.heights.count - 1)
+        guard startIdx <= endIdx else { return 0 }
+        let f = max(0, min(1, fraction))
+        var removed: CGFloat = 0
+        for i in startIdx...endIdx {
+            let take = state.heights[i] * f
+            state.heights[i] -= take
+            removed += take
+        }
+        noteChange(state, amount: removed)
+        return removed
+    }
+
     func clearRange(_ state: SurfaceState, minX: CGFloat, maxX: CGFloat) {
         let startIdx = max(Int((minX - state.surface.minX) / Self.columnWidth), 0)
         let endIdx = min(Int((maxX - state.surface.minX) / Self.columnWidth), state.heights.count - 1)

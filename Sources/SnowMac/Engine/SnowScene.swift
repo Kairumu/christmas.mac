@@ -836,6 +836,11 @@ final class SnowScene: SKScene, SnowSceneAPI {
     /// normal lazy-sweep routine.
     func summonSweeperForSnowman() {
         guard accumulator != nil else { return }
+        if ProcessInfo.processInfo.environment["SNOWMAC_DEBUG"] != nil {
+            let laden = accumulator.mostLadenSurface()
+            let span = laden.map { $0.surface.maxX - $0.surface.minX }
+            FileHandle.standardError.write("SNOWMAC_DEBUG snowman: summonSweeperForSnowman sweeperActive=\(sweeper != nil) airborne=\(sweeper?.isAirborne ?? false) raging=\(sweeper?.isRaging ?? false) targetKind=\(String(describing: laden?.surface.kind)) targetSpan=\(span.map { String(format: "%.1f", $0) } ?? "nil")\n".data(using: .utf8)!)
+        }
         // If she's ALREADY summoned (영서 소환), the request isn't ignored:
         // she drops whatever she was doing and poof-teleports back in build
         // mode — consistent with her teleport language, and far simpler
