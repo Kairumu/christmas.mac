@@ -143,7 +143,16 @@ final class SweeperCharacter {
     /// proxy for "stuck": it only grows while a push overflows, so it stays
     /// near 0 during ordinary sweeping (her push window ahead still has
     /// room) and climbs quickly once the pile immediately ahead saturates.
-    private static let rageCarriedSnowThreshold: CGFloat = 60
+    // Raised 60 → 150 and gated behind a minimum active time: on a
+    // saturated (blizzard-buried) surface every push overflows, so the old
+    // threshold tripped within ~2-4 seconds of arriving — she'd rage-throw
+    // and exit almost immediately after being summoned, which users read
+    // as "영서가 바로 꺼진다". Rage should be a rare "I've been at this
+    // forever and it's hopeless" moment, not her opening move.
+    private static let rageCarriedSnowThreshold: CGFloat = 150
+    /// She never rages before this much active working time has passed,
+    /// no matter how much overflow she's carrying.
+    private static let rageMinActiveTime: TimeInterval = 12
     /// Pack pose hold duration (step 2 of the sequence) — also how long the
     /// prop ball takes to pop up to its packed size.
     private static let ragePackHoldDuration: TimeInterval = 0.6
@@ -1130,7 +1139,9 @@ final class SweeperCharacter {
         // instead of fitting anywhere — see rageCarriedSnowThreshold's doc.
         // Fires at most once per summon (hasRaged latches) and preempts
         // the rest of this tick (quirks, rollNextActivity) entirely.
-        if !hasRaged, carriedSnow >= Self.rageCarriedSnowThreshold {
+        if !hasRaged,
+           activeTime >= Self.rageMinActiveTime,
+           carriedSnow >= Self.rageCarriedSnowThreshold {
             hasRaged = true
             beginRage()
             return
