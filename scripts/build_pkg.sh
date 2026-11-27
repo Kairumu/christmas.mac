@@ -37,10 +37,10 @@ cat > "$DIST" <<EOF
 데스크톱에 눈이 내리고, 창과 Dock 위에 쌓이고,
 영서를 소환해 눈을 쓸거나 눈사람을 만들 수 있습니다.
 
-요구 사항: Apple Silicon Mac, macOS 13 이상
+요구 사항: macOS 13 이상 (Apple Silicon / Intel)
 설치 후 메뉴 막대의 눈송이 아이콘에서 시작하세요.
 ]]></welcome>
-    <options customize="never" require-scripts="false" hostArchitectures="arm64"/>
+    <options customize="never" require-scripts="false" hostArchitectures="arm64,x86_64"/>
     <domains enable_localSystem="true"/>
     <choices-outline>
         <line choice="default"/>

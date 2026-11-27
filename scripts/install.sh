@@ -13,11 +13,6 @@ URL="https://github.com/$REPO/releases/latest/download/SnowMac.zip"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-if [ "$(uname -m)" != "arm64" ]; then
-    echo "이 앱은 Apple Silicon(M1 이상) Mac 전용입니다." >&2
-    exit 1
-fi
-
 echo "눈 내리는 맥 다운로드 중..."
 curl -fSL --progress-bar "$URL" -o "$TMP/SnowMac.zip"
 

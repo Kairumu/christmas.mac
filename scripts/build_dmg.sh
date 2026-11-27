@@ -30,7 +30,7 @@ cat > "$STAGE/설치 안내.txt" <<'EOF'
 3. 메뉴 막대의 눈송이 아이콘에서 눈 양 조절, 영서 소환,
    제설차, 배경화면 등을 사용할 수 있습니다.
 
-요구 사항: Apple Silicon Mac, macOS 13 이상
+요구 사항: macOS 13 이상 (Apple Silicon / Intel)
 EOF
 
 hdiutil create \

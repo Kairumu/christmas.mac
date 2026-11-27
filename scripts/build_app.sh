@@ -4,10 +4,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-echo "==> swift build -c release"
-swift build -c release
+# Universal binary: Tahoe (macOS 26) still runs on several Intel Macs, and
+# an arm64-only slice simply refuses to launch there.
+ARCHES=(--arch arm64 --arch x86_64)
+echo "==> swift build -c release (universal)"
+swift build -c release "${ARCHES[@]}"
 
-BIN_PATH="$(swift build -c release --show-bin-path)/SnowMac"
+BIN_PATH="$(swift build -c release "${ARCHES[@]}" --show-bin-path)/SnowMac"
 
 APP_DIR="$ROOT_DIR/build/SnowMac.app"
 CONTENTS_DIR="$APP_DIR/Contents"
@@ -31,7 +34,7 @@ chmod +x "$MACOS_DIR/SnowMac"
 # won't find it here; SweeperCharacter.swift falls back to Bundle.main.resourceURL
 # (i.e. exactly this location) when that lookup misses.
 BUNDLE_NAME="SnowMac_SnowMac.bundle"
-BUNDLE_PATH="$(swift build -c release --show-bin-path)/$BUNDLE_NAME"
+BUNDLE_PATH="$(swift build -c release "${ARCHES[@]}" --show-bin-path)/$BUNDLE_NAME"
 if [ -d "$BUNDLE_PATH" ]; then
     echo "==> copying resource bundle"
     cp -R "$BUNDLE_PATH" "$RESOURCES_DIR/$BUNDLE_NAME"
